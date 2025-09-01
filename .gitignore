@@ -1,0 +1,26 @@
+# Rust
+/target
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+test_*.txt
+*_test.txt
+results.txt
+comprehensive_test.txt
+ultra_test_*.txt
+large_domains.txt
+
+# Logs
+*.log
+performance.log

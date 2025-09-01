@@ -1,0 +1,29 @@
+# High-Performance DNS Resolvers
+# This file contains a curated list of fast, reliable DNS servers
+# Use with: qdns -r examples/dns_resolvers.txt
+
+# Cloudflare (Fastest)
+1.1.1.1
+1.0.0.1
+
+# Google Public DNS (Reliable)  
+8.8.8.8
+8.8.4.4
+
+# Quad9 (Security-focused)
+9.9.9.9
+149.112.112.112
+
+# OpenDNS (Content filtering)
+208.67.222.222
+208.67.220.220
+
+# Additional High-Performance Resolvers
+76.76.2.0
+76.76.10.0
+185.228.168.9
+185.228.169.9
+
+# For maximum performance, use:
+# - examples/resolvers-trusted.txt (31 trusted resolvers)
+# - examples/resolvers.txt (22,923 resolvers for ultimate speed)
