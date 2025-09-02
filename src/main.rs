@@ -207,8 +207,11 @@ struct Cli {
     #[arg(long = "debug", help = "Display debug output")]
     debug: bool,
     
-    #[arg(long = "retry", default_value = "2", help = "Number of DNS attempts")]
+    #[arg(long = "retry", default_value = "3", help = "Number of DNS attempts [default: 3]")]
     retry: u32,
+
+    #[arg(long = "all-results", help = "Output all DNS responses, including NXDOMAIN/SERVFAIL")]
+    all_results: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +416,7 @@ async fn process_domains(
     sender: Sender<DnsResult>,
     semaphore: Arc<Semaphore>,
     silent: bool,
+    resp_only: bool,
 ) {
     let tasks = domains.into_iter().flat_map(|domain| {
         let resolver_clone = resolver.clone();
@@ -452,7 +456,7 @@ async fn process_domains(
                 }
                 
                 let count = PROGRESS_COUNTER.fetch_add(1, Ordering::Relaxed);
-                if count % 10000 == 0 && !silent {
+                if count % 10000 == 0 && !silent && !resp_only {
                     let total = TOTAL_COUNTER.load(Ordering::Relaxed);
                     eprintln!("Progress: {}/{} ({:.1}%)", count, total, (count as f64 / total as f64) * 100.0);
                 }
@@ -463,7 +467,7 @@ async fn process_domains(
     join_all(tasks).await;
 }
 
-fn should_display_result(result: &DnsResult, rcode_filter: &Option<String>) -> bool {
+fn should_display_result(result: &DnsResult, rcode_filter: &Option<String>, args: &Cli) -> bool {
     if let Some(filter) = rcode_filter {
         let allowed_codes: HashSet<_> = filter
             .split(',')
@@ -475,8 +479,13 @@ fn should_display_result(result: &DnsResult, rcode_filter: &Option<String>) -> b
 }
 
 fn format_output(result: &DnsResult, args: &Cli) -> String {
+    // For resp_only, only return successful results without errors
     if args.resp_only {
-        return result.data.clone();
+        if result.rcode == "NOERROR" && !result.data.starts_with("Error:") {
+            return result.data.clone();
+        } else {
+            return String::new(); // Return empty string for errors
+        }
     }
     
     if args.resp {
@@ -508,21 +517,17 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
     let start_time = Instant::now();
     
-    if !args.silent {
+    if !args.silent && !args.resp_only {
         eprintln!("🚀 QDNS - Ultra-fast DNS resolver starting...");
         eprintln!("⚡ Configuring system for maximum performance...");
     }
 
     // Configure system for high performance
-    configure_system_for_performance(!args.silent).unwrap_or_else(|e| {
-        if !args.silent {
+    configure_system_for_performance(!args.silent && !args.resp_only).unwrap_or_else(|e| {
+        if !args.silent && !args.resp_only {
             eprintln!("⚠️  System configuration warning: {}", e);
         }
     });
-
-    if !args.silent {
-        eprintln!("🔧 Using {} concurrent threads", args.threads);
-    }
 
     // Determine record types to query
     let record_types = determine_record_types(&args);
@@ -586,13 +591,23 @@ async fn main() -> Result<()> {
     let total_queries = all_domains.len() * record_types.len();
     TOTAL_COUNTER.store(total_queries as u64, Ordering::Relaxed);
     
-    if !args.silent {
+    if !args.silent && !args.resp_only {
         eprintln!("📊 Processing {} domains with {} record types ({} total queries)", 
                  all_domains.len(), record_types.len(), total_queries);
     }
 
     // Setup concurrency control
-    let semaphore = Arc::new(Semaphore::new(args.threads));
+    // Auto-scale threads if input is less than default
+    let thread_count = if all_domains.len() < args.threads {
+        all_domains.len().max(1)
+    } else {
+        args.threads
+    };
+
+    let semaphore = Arc::new(Semaphore::new(thread_count));
+    if !args.silent && !args.resp_only {
+        eprintln!("🔧 Using {} concurrent threads", thread_count);
+    }
     let (sender, receiver): (Sender<DnsResult>, Receiver<DnsResult>) = crossbeam_channel::unbounded();
     
     let query_config = QueryConfig {
@@ -608,6 +623,7 @@ async fn main() -> Result<()> {
         sender,
         semaphore,
         args.silent,
+        args.resp_only,
     ));
 
     // Setup output
@@ -624,7 +640,7 @@ async fn main() -> Result<()> {
     while let Ok(result) = receiver.recv() {
         results_count += 1;
         
-        if should_display_result(&result, &args.rcode) {
+        if should_display_result(&result, &args.rcode, &args) {
             let formatted = format_output(&result, &args);
             if !formatted.is_empty() {
                 writeln!(output_writer, "{}", formatted)?;
@@ -644,7 +660,7 @@ async fn main() -> Result<()> {
     
     let elapsed = start_time.elapsed();
     
-    if !args.silent {
+    if !args.silent && !args.resp_only {
         eprintln!("✅ Completed in {:.2}s", elapsed.as_secs_f64());
         eprintln!("📈 Processed {} queries ({:.0} queries/sec)", 
                  results_count, results_count as f64 / elapsed.as_secs_f64());
