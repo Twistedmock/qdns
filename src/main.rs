@@ -538,18 +538,37 @@ async fn main() -> Result<()> {
     } else {
         // Use high-performance trusted DNS resolvers for maximum speed and reliability
         vec![
-            "1.1.1.1".to_string(),      // Cloudflare Primary
-            "1.0.0.1".to_string(),      // Cloudflare Secondary  
-            "8.8.8.8".to_string(),      // Google Primary
-            "8.8.4.4".to_string(),      // Google Secondary
-            "9.9.9.9".to_string(),      // Quad9
-            "208.67.222.222".to_string(), // OpenDNS
-            "208.67.220.220".to_string(), // OpenDNS
-            "149.112.112.112".to_string(), // Quad9 Secondary
-            "76.76.2.0".to_string(),    // Control D
-            "76.76.10.0".to_string(),   // Control D
-            "185.228.168.9".to_string(), // CleanBrowsing
-            "185.228.169.9".to_string(), // CleanBrowsing
+            "1.0.0.1".to_string(),
+            "1.1.1.1".to_string(),
+            "134.195.4.2".to_string(),
+            "149.112.112.112".to_string(),
+            "159.89.120.99".to_string(),
+            "185.228.168.9".to_string(),
+            "185.228.169.9".to_string(),
+            "195.46.39.39".to_string(),
+            "195.46.39.40".to_string(),
+            "205.171.2.65".to_string(),
+            "205.171.3.65".to_string(),
+            "208.67.220.220".to_string(),
+            "208.67.222.222".to_string(),
+            "216.146.35.35".to_string(),
+            "216.146.36.36".to_string(),
+            "64.6.64.6".to_string(),
+            "64.6.65.6".to_string(),
+            "74.82.42.42".to_string(),
+            "76.76.10.0".to_string(),
+            "76.76.2.0".to_string(),
+            "77.88.8.1".to_string(),
+            "77.88.8.8".to_string(),
+            "8.20.247.20".to_string(),
+            "8.26.56.26".to_string(),
+            "8.8.4.4".to_string(),
+            "8.8.8.8".to_string(),
+            "84.200.69.80".to_string(),
+            "84.200.70.40".to_string(),
+            "89.233.43.71".to_string(),
+            "9.9.9.9".to_string(),
+            "91.239.100.100".to_string(),
         ]
     };
     
