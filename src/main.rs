@@ -189,6 +189,12 @@ struct Cli {
     // RATE-LIMIT
     #[arg(short = 't', long = "threads", default_value_t = calculate_optimal_threads(), help = "Number of concurrent threads")]
     threads: usize,
+    
+    #[arg(long = "rate-limit", default_value = "1000", help = "Max queries per second per resolver [default: 1000]")]
+    rate_limit: u64,
+    
+    #[arg(long = "resolver-timeout", default_value = "2000", help = "DNS resolver timeout in milliseconds [default: 2000]")]
+    resolver_timeout: u64,
 
     // OUTPUT
     #[arg(short = 'o', long = "output", help = "File to write output")]
@@ -233,6 +239,8 @@ static PROGRESS_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TOTAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 static RESOLVER_CACHE: Lazy<DashMap<String, Arc<TokioAsyncResolver>>> = Lazy::new(DashMap::new);
+static RESOLVER_HEALTH: Lazy<DashMap<String, (u64, u64, Instant)>> = Lazy::new(DashMap::new); // (success_count, fail_count, last_used)
+static RATE_LIMITER: Lazy<DashMap<String, (u64, Instant)>> = Lazy::new(DashMap::new); // (query_count, window_start)
 
 async fn create_resolver(nameserver: Option<&str>) -> Result<Arc<TokioAsyncResolver>> {
     let key = nameserver.unwrap_or("default").to_string();
@@ -244,27 +252,46 @@ async fn create_resolver(nameserver: Option<&str>) -> Result<Arc<TokioAsyncResol
     let mut config = ResolverConfig::default();
     let mut opts = ResolverOpts::default();
     
-    // Ultra-aggressive performance settings for maximum speed
-    opts.timeout = Duration::from_millis(100); // Very short timeout for speed
-    opts.attempts = 1; // Single attempt for speed
+    // Anti-poisoning settings inspired by dnsx
+    opts.timeout = Duration::from_millis(3000); // 3 second timeout like dnsx
+    opts.attempts = 2; // Multiple attempts for reliability
     opts.ndots = 0; // Don't append search domains
     opts.edns0 = true; // Enable EDNS for better performance
     opts.validate = false; // Skip DNSSEC validation for speed
     opts.ip_strategy = trust_dns_resolver::config::LookupIpStrategy::Ipv4thenIpv6; // Prefer IPv4 for speed
-    opts.cache_size = 1024; // Small cache to avoid memory overhead
+    opts.cache_size = 4096; // Larger cache for better performance
     opts.use_hosts_file = false; // Skip hosts file for speed
-    opts.positive_min_ttl = Some(Duration::from_secs(1)); // Minimum cache time
-    opts.negative_min_ttl = Some(Duration::from_millis(100)); // Very short negative cache
-    opts.positive_max_ttl = Some(Duration::from_secs(30)); // Short positive cache for accuracy
-    opts.num_concurrent_reqs = 1000; // High concurrency per resolver
+    opts.positive_min_ttl = Some(Duration::from_secs(5)); // Reasonable cache time
+    opts.negative_min_ttl = Some(Duration::from_secs(1)); // Short negative cache
+    opts.positive_max_ttl = Some(Duration::from_secs(300)); // 5 minute cache for efficiency
+    opts.num_concurrent_reqs = 100; // Conservative concurrency per resolver
 
     if let Some(ns) = nameserver {
-        if let Ok(ip) = ns.parse::<IpAddr>() {
+        // Parse UDP protocol specification like dnsx (udp:IP:port)
+        let resolver_addr = if ns.starts_with("udp:") {
+            ns.strip_prefix("udp:").unwrap_or(ns)
+        } else {
+            ns
+        };
+        
+        if let Ok(socket_addr) = resolver_addr.parse::<SocketAddr>() {
+            config = ResolverConfig::from_parts(
+                None, 
+                vec![], 
+                vec![
+                    NameServerConfig::new(socket_addr, Protocol::Udp), // Primary UDP
+                    NameServerConfig::new(socket_addr, Protocol::Tcp), // TCP fallback like dnsx
+                ]
+            );
+        } else if let Ok(ip) = resolver_addr.parse::<IpAddr>() {
             let socket_addr = SocketAddr::new(ip, 53);
             config = ResolverConfig::from_parts(
                 None, 
                 vec![], 
-                vec![NameServerConfig::new(socket_addr, Protocol::Udp)]
+                vec![
+                    NameServerConfig::new(socket_addr, Protocol::Udp), // Primary UDP
+                    NameServerConfig::new(socket_addr, Protocol::Tcp), // TCP fallback like dnsx
+                ]
             );
         }
     }
@@ -274,16 +301,86 @@ async fn create_resolver(nameserver: Option<&str>) -> Result<Arc<TokioAsyncResol
     Ok(resolver)
 }
 
+fn should_use_resolver(resolver_ip: &str, rate_limit: u64) -> bool {
+    let now = Instant::now();
+    
+    // Check rate limit
+    if let Some(mut entry) = RATE_LIMITER.get_mut(resolver_ip) {
+        let (count, window_start) = entry.value_mut();
+        
+        if now.duration_since(*window_start) > Duration::from_secs(1) {
+            // Reset window
+            *count = 0;
+            *window_start = now;
+        }
+        
+        if *count >= rate_limit {
+            return false; // Rate limited
+        }
+        
+        *count += 1;
+    } else {
+        RATE_LIMITER.insert(resolver_ip.to_string(), (1, now));
+    }
+    
+    // Check resolver health (skip resolvers with >50% failure rate)
+    if let Some(health) = RESOLVER_HEALTH.get(resolver_ip) {
+        let (success, fail, _) = health.value();
+        if *success + *fail > 10 && (*fail as f64 / (*success + *fail) as f64) > 0.5 {
+            return false; // Too many failures
+        }
+    }
+    
+    true
+}
+
+fn update_resolver_health(resolver_ip: &str, success: bool) {
+    let now = Instant::now();
+    RESOLVER_HEALTH.entry(resolver_ip.to_string())
+        .and_modify(|(s, f, t)| {
+            if success { *s += 1 } else { *f += 1 }
+            *t = now;
+        })
+        .or_insert((if success { 1 } else { 0 }, if success { 0 } else { 1 }, now));
+}
+
 async fn resolve_domain(
     domain: &str,
     record_type: RecordType,
-    resolver: Arc<TokioAsyncResolver>,
+    resolver_list: &[String],
     retry_count: u32,
+    rate_limit: u64,
 ) -> Result<Vec<DnsResult>, ResolveError> {
     let start = Instant::now();
     let mut last_error = None;
 
     for attempt in 0..=retry_count {
+        // Smart resolver selection: find healthy, non-rate-limited resolver
+        let mut selected_resolver = None;
+        let mut resolver_ip = None;
+        
+        for i in 0..resolver_list.len() {
+            let candidate_ip = &resolver_list[(attempt as usize + domain.len() + i) % resolver_list.len()];
+            if should_use_resolver(candidate_ip, rate_limit) {
+                if let Ok(resolver) = create_resolver(Some(candidate_ip)).await {
+                    selected_resolver = Some(resolver);
+                    resolver_ip = Some(candidate_ip.clone());
+                    break;
+                }
+            }
+        }
+        
+        let (resolver, resolver_ip) = match (selected_resolver, resolver_ip) {
+            (Some(r), Some(ip)) => (r, ip),
+            _ => {
+                // Fallback to any available resolver if all are rate limited
+                let fallback_ip = &resolver_list[attempt as usize % resolver_list.len()];
+                (create_resolver(Some(fallback_ip)).await.unwrap_or_else(|_| {
+                    // This should not happen, but create a default resolver if it does
+                    Arc::new(AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default()))
+                }), fallback_ip.clone())
+            }
+        };
         let result = match record_type {
             RecordType::A | RecordType::AAAA => {
                 resolver.lookup_ip(domain).await.map(|lookup| {
@@ -328,8 +425,12 @@ async fn resolve_domain(
         };
 
         match result {
-            Ok(results) => return Ok(results),
+            Ok(results) => {
+                update_resolver_health(&resolver_ip, true);
+                return Ok(results);
+            },
             Err(e) => {
+                update_resolver_health(&resolver_ip, false);
                 last_error = Some(e);
                 if attempt < retry_count {
                     sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
@@ -412,20 +513,21 @@ fn determine_record_types(args: &Cli) -> Vec<RecordType> {
 async fn process_domains(
     domains: Vec<String>,
     query_config: QueryConfig,
-    resolver: Arc<TokioAsyncResolver>,
+    resolver_list: Vec<String>,
     sender: Sender<DnsResult>,
     semaphore: Arc<Semaphore>,
     silent: bool,
     resp_only: bool,
+    rate_limit: u64,
 ) {
     let tasks = domains.into_iter().flat_map(|domain| {
-        let resolver_clone = resolver.clone();
+        let resolver_list_clone = resolver_list.clone();
         let sender_clone = sender.clone();
         let semaphore_clone = semaphore.clone();
         
         query_config.record_types.iter().map(move |&record_type| {
             let domain = domain.clone();
-            let resolver = resolver_clone.clone();
+            let resolver_list = resolver_list_clone.clone();
             let sender = sender_clone.clone();
             let semaphore = semaphore_clone.clone();
             let retry_count = query_config.retry_count;
@@ -433,7 +535,7 @@ async fn process_domains(
             async move {
                 let _permit = semaphore.acquire().await.unwrap();
                 
-                match resolve_domain(&domain, record_type, resolver, retry_count).await {
+                match resolve_domain(&domain, record_type, &resolver_list, retry_count, rate_limit).await {
                     Ok(results) => {
                         for result in results {
                             let _ = sender.send(result);
@@ -536,43 +638,43 @@ async fn main() -> Result<()> {
     let resolver_list = if let Some(ref resolver_input) = args.resolver {
         parse_comma_separated_or_file(resolver_input)?
     } else {
-        // Use high-performance trusted DNS resolvers for maximum speed and reliability
+        // Use high-performance trusted DNS resolvers with UDP protocol specification (like dnsx)
         vec![
-            "1.0.0.1".to_string(),
-            "1.1.1.1".to_string(),
-            "134.195.4.2".to_string(),
-            "149.112.112.112".to_string(),
-            "159.89.120.99".to_string(),
-            "185.228.168.9".to_string(),
-            "185.228.169.9".to_string(),
-            "195.46.39.39".to_string(),
-            "195.46.39.40".to_string(),
-            "205.171.2.65".to_string(),
-            "205.171.3.65".to_string(),
-            "208.67.220.220".to_string(),
-            "208.67.222.222".to_string(),
-            "216.146.35.35".to_string(),
-            "216.146.36.36".to_string(),
-            "64.6.64.6".to_string(),
-            "64.6.65.6".to_string(),
-            "74.82.42.42".to_string(),
-            "76.76.10.0".to_string(),
-            "76.76.2.0".to_string(),
-            "77.88.8.1".to_string(),
-            "77.88.8.8".to_string(),
-            "8.20.247.20".to_string(),
-            "8.26.56.26".to_string(),
-            "8.8.4.4".to_string(),
-            "8.8.8.8".to_string(),
-            "84.200.69.80".to_string(),
-            "84.200.70.40".to_string(),
-            "89.233.43.71".to_string(),
-            "9.9.9.9".to_string(),
-            "91.239.100.100".to_string(),
+            "udp:1.0.0.1:53".to_string(),
+            "udp:1.1.1.1:53".to_string(),
+            "udp:134.195.4.2:53".to_string(),
+            "udp:149.112.112.112:53".to_string(),
+            "udp:159.89.120.99:53".to_string(),
+            "udp:185.228.168.9:53".to_string(),
+            "udp:185.228.169.9:53".to_string(),
+            "udp:195.46.39.39:53".to_string(),
+            "udp:195.46.39.40:53".to_string(),
+            "udp:205.171.2.65:53".to_string(),
+            "udp:205.171.3.65:53".to_string(),
+            "udp:208.67.220.220:53".to_string(),
+            "udp:208.67.222.222:53".to_string(),
+            "udp:216.146.35.35:53".to_string(),
+            "udp:216.146.36.36:53".to_string(),
+            "udp:64.6.64.6:53".to_string(),
+            "udp:64.6.65.6:53".to_string(),
+            "udp:74.82.42.42:53".to_string(),
+            "udp:76.76.10.0:53".to_string(),
+            "udp:76.76.2.0:53".to_string(),
+            "udp:77.88.8.1:53".to_string(),
+            "udp:77.88.8.8:53".to_string(),
+            "udp:8.20.247.20:53".to_string(),
+            "udp:8.26.56.26:53".to_string(),
+            "udp:8.8.4.4:53".to_string(),
+            "udp:8.8.8.8:53".to_string(),
+            "udp:84.200.69.80:53".to_string(),
+            "udp:84.200.70.40:53".to_string(),
+            "udp:89.233.43.71:53".to_string(),
+            "udp:9.9.9.9:53".to_string(),
+            "udp:91.239.100.100:53".to_string(),
         ]
     };
     
-    let resolver = create_resolver(resolver_list.first().map(|s| s.as_str())).await?;
+    // No need to create a single resolver - we'll create them dynamically per query
 
     // Collect all domains to process
     let mut all_domains = Vec::new();
@@ -638,11 +740,12 @@ async fn main() -> Result<()> {
     let process_handle = tokio::spawn(process_domains(
         all_domains,
         query_config,
-        resolver,
+        resolver_list,
         sender,
         semaphore,
         args.silent,
         args.resp_only,
+        args.rate_limit,
     ));
 
     // Setup output
