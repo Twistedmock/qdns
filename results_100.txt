@@ -1,0 +1,100 @@
+.apple.com ERROR Malformed label:  0ms
+1-courier.sandbox.push.apple.com A 1.courier-sandbox-push-apple.com.akadns.net. 63ms
+17-121-112-154.applebot.apple.com A 17.121.112.154 63ms
+17-121-112-141.applebot.apple.com A 17.121.112.141 63ms
+17-121-112-105.applebot.apple.com A 17.121.112.105 63ms
+17-121-112-107.applebot.apple.com A 17.121.112.107 63ms
+*.apple.com ERROR DNS error: NoError 63ms
+17-121-112-125.applebot.apple.com A 17.121.112.125 63ms
+17-121-112-104.applebot.apple.com A 17.121.112.104 63ms
+14-courier.push.apple.com A 14.courier-push-apple.com.akadns.net. 63ms
+17-121-112-123.applebot.apple.com A 17.121.112.123 65ms
+12-courier.push.apple.com A 12.courier-push-apple.com.akadns.net. 65ms
+17-121-112-143.applebot.apple.com A 17.121.112.143 65ms
+17-121-112-142.applebot.apple.com A 17.121.112.142 65ms
+116-202-179-217.applebot.apple.com ERROR DNS error: NXDomain 65ms
+*.iadsdk.apple.com ERROR DNS error: NXDomain 66ms
+1103-117.applebot.apple.com ERROR DNS error: NXDomain 65ms
+*.dns.apple.com ERROR DNS error: NXDomain 66ms
+17-121-112-106.applebot.apple.com A 17.121.112.106 65ms
+17-121-112-133.applebot.apple.com A 17.121.112.133 65ms
+108.61.217.98.apple.com ERROR DNS error: NoError 65ms
+*.geo.apple.com ERROR DNS error: NXDomain 66ms
+17-121-112-128.applebot.apple.com A 17.121.112.128 65ms
+17-121-112-11.applebot.apple.com A 17.121.112.11 65ms
+17-121-112-129.applebot.apple.com A 17.121.112.129 65ms
+17-121-112-121.applebot.apple.com A 17.121.112.121 65ms
+17-121-112-10.applebot.apple.com A 17.121.112.10 65ms
+17-121-112-146.applebot.apple.com A 17.121.112.146 65ms
+17-121-112-118.applebot.apple.com A 17.121.112.118 65ms
+17-121-112-126.applebot.apple.com A 17.121.112.126 65ms
+1-courier.push.apple.com A 1.courier-push-apple.com.akadns.net. 65ms
+17-121-112-140.applebot.apple.com A 17.121.112.140 66ms
+17-121-112-136.applebot.apple.com A 17.121.112.136 65ms
+17-121-112-155.applebot.apple.com A 17.121.112.155 65ms
+17-121-112-151.applebot.apple.com A 17.121.112.151 65ms
+17-121-112-119.applebot.apple.com A 17.121.112.119 66ms
+17-121-112-108.applebot.apple.com A 17.121.112.108 66ms
+17-121-112-117.applebot.apple.com A 17.121.112.117 65ms
+17-121-112-137.applebot.apple.com A 17.121.112.137 66ms
+17-121-112-148.applebot.apple.com A 17.121.112.148 65ms
+16-courier.push.apple.com A 16.courier-push-apple.com.akadns.net. 65ms
+163.15tunes-old.apple.com ERROR DNS error: NoError 66ms
+*.us-east-1b.appds.apple.com ERROR DNS error: NoError 66ms
+11-courier.push.apple.com A 11.courier-push-apple.com.akadns.net. 66ms
+108.160.142.179.apple.com ERROR DNS error: NoError 65ms
+*.icloud.apple.com ERROR DNS error: NXDomain 66ms
+*.amp.apple.com ERROR DNS error: NXDomain 67ms
+17-121-112-115.applebot.apple.com A 17.121.112.115 66ms
+17-121-112-14.applebot.apple.com A 17.121.112.14 66ms
+012.ts.apple.com ERROR DNS error: NXDomain 67ms
+17-121-112-144.applebot.apple.com A 17.121.112.144 66ms
+17-121-112-132.applebot.apple.com A 17.121.112.132 66ms
+17-121-112-110.applebot.apple.com A 17.121.112.110 66ms
+17-121-112-135.applebot.apple.com A 17.121.112.135 66ms
+*.itunes.apple.com ERROR DNS error: NXDomain 67ms
+17-121-112-113.applebot.apple.com A 17.121.112.113 66ms
+1.applebot.apple.com ERROR DNS error: NXDomain 67ms
+17-121-112-138.applebot.apple.com A 17.121.112.138 66ms
+13-courier.push.apple.com A 13.courier-push-apple.com.akadns.net. 66ms
+*.push.apple.com ERROR DNS error: NXDomain 67ms
+17-121-112-114.applebot.apple.com A 17.121.112.114 66ms
+100best.music.apple.com A 100best.music-lb.itunes-apple.com.akadns.net. 67ms
+17-121-112-120.applebot.apple.com A 17.121.112.120 69ms
+17-121-112-134.applebot.apple.com A 17.121.112.134 69ms
+*.ikigai-poc.g.apple.com ERROR DNS error: NoError 70ms
+17-121-112-157.applebot.apple.com A 17.121.112.157 69ms
+17-121-112-156.applebot.apple.com A 17.121.112.156 69ms
+13523515.apple.com ERROR DNS error: NoError 69ms
+17-121-112-139.applebot.apple.com A 17.121.112.139 69ms
+17-121-112-150.applebot.apple.com A 17.121.112.150 69ms
+17-121-112-112.applebot.apple.com A 17.121.112.112 69ms
+17-121-112-152.applebot.apple.com A 17.121.112.152 69ms
+140.82.54.51.apple.com ERROR DNS error: NoError 69ms
+*.ls.apple.com ERROR DNS error: NXDomain 69ms
+16.ts.apple.com ERROR DNS error: NXDomain 69ms
+17-121-112-127.applebot.apple.com A 17.121.112.127 69ms
+*.us-east-1b.app6.apple.com ERROR DNS error: NoError 69ms
+167.179.73.141.apple.com ERROR DNS error: NoError 69ms
+17-121-112-101.applebot.apple.com A 17.121.112.101 69ms
+17-121-112-102.applebot.apple.com A 17.121.112.102 69ms
+17-121-112-1.applebot.apple.com A 17.121.112.1 69ms
+17-121-112-111.applebot.apple.com A 17.121.112.111 69ms
+17-121-112-109.applebot.apple.com A 17.121.112.109 69ms
+15-courier.push.apple.com A 15.courier-push-apple.com.akadns.net. 69ms
+17-121-112-13.applebot.apple.com A 17.121.112.13 69ms
+17-121-112-145.applebot.apple.com A 17.121.112.145 69ms
+17-121-112-149.applebot.apple.com A 17.121.112.149 69ms
+*.isu.apple.com ERROR DNS error: NoError 69ms
+17-121-112-147.applebot.apple.com A 17.121.112.147 69ms
+17-121-112-15.applebot.apple.com A 17.121.112.15 69ms
+10-courier.push.apple.com A 10.courier-push-apple.com.akadns.net. 139ms
+17-121-112-153.applebot.apple.com A 17.121.112.153 228ms
+17-121-112-131.applebot.apple.com A 17.121.112.131 228ms
+17-121-112-12.applebot.apple.com A 17.121.112.12 228ms
+17-121-112-130.applebot.apple.com A 17.121.112.130 228ms
+17-121-112-124.applebot.apple.com A 17.121.112.124 228ms
+17-121-112-100.applebot.apple.com A 17.121.112.100 228ms
+17-121-112-122.applebot.apple.com A 17.121.112.122 228ms
+17-121-112-103.applebot.apple.com A 17.121.112.103 228ms
+17-121-112-116.applebot.apple.com A 17.121.112.116 228ms
