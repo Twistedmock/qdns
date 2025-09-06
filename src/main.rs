@@ -31,8 +31,8 @@ async fn main() -> Result<()> {
 
     // Use default resolvers if none were provided
     if !args.has_custom_resolvers() {
-        info!("🔍 No custom resolvers provided, using curated stable resolver set...");
-        args.resolvers = get_default_resolvers();
+        info!("🔍 No custom resolvers provided, loading curated + Trickest resolver sets...");
+        args.resolvers = get_default_resolvers().await;
     }
 
     // Initialize system optimizer

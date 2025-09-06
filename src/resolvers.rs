@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::{info, warn, error};
+
+const TRICKEST_RESOLVERS_URL: &str = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers.txt";
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default stable resolver set for high-performance DNS resolution
 /// These are carefully curated for reliability and performance
@@ -70,7 +74,7 @@ fn get_stable_resolvers() -> Vec<SocketAddr> {
     resolvers
 }
 
-/// Parse resolvers from text content (for custom resolver files)
+/// Parse resolvers from text content (for custom resolver files and Trickest list)
 fn parse_resolvers(content: &str) -> Result<Vec<SocketAddr>> {
     let mut resolvers = Vec::new();
     let mut line_count = 0;
@@ -118,9 +122,68 @@ fn parse_resolvers(content: &str) -> Result<Vec<SocketAddr>> {
     Ok(resolvers)
 }
 
-/// Get default resolvers (stable set, no external downloads)
-pub fn get_default_resolvers() -> Vec<SocketAddr> {
-    get_stable_resolvers()
+/// Get default resolvers (curated set + downloaded Trickest list)
+pub async fn get_default_resolvers() -> Vec<SocketAddr> {
+    let mut all_resolvers = get_stable_resolvers();
+    
+    // Download and append Trickest resolvers
+    match download_trickest_resolvers().await {
+        Ok(mut trickest_resolvers) => {
+            let original_count = all_resolvers.len();
+            
+            // Remove duplicates by converting to set-like behavior
+            trickest_resolvers.retain(|resolver| !all_resolvers.contains(resolver));
+            
+            let new_count = trickest_resolvers.len();
+            all_resolvers.extend(trickest_resolvers);
+            
+            info!(
+                "✅ Combined resolver pool: {} curated + {} from Trickest = {} total",
+                original_count, new_count, all_resolvers.len()
+            );
+        }
+        Err(e) => {
+            warn!("⚠️ Failed to download Trickest resolvers: {}", e);
+            warn!("🔄 Continuing with {} curated resolvers only", all_resolvers.len());
+        }
+    }
+    
+    all_resolvers
+}
+
+/// Download and parse resolvers from the Trickest resolvers list
+async fn download_trickest_resolvers() -> Result<Vec<SocketAddr>> {
+    info!("📡 Downloading resolvers from Trickest list...");
+    
+    let client = reqwest::Client::builder()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .user_agent("qdns/0.1.0")
+        .build()
+        .context("Failed to create HTTP client")?;
+    
+    let response = client
+        .get(TRICKEST_RESOLVERS_URL)
+        .send()
+        .await
+        .context("Failed to download Trickest resolvers list")?;
+    
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "HTTP error downloading resolvers: {}", 
+            response.status()
+        ));
+    }
+    
+    let content = response
+        .text()
+        .await
+        .context("Failed to read response body")?;
+    
+    let resolvers = parse_resolvers(&content)?;
+    
+    info!("✅ Downloaded {} resolvers from Trickest", resolvers.len());
+    
+    Ok(resolvers)
 }
 
 /// Parse resolvers from a custom file (for --resolvers-file option)
@@ -161,13 +224,30 @@ invalid-ip
 
     #[test]
     fn test_default_resolvers() {
-        let resolvers = get_default_resolvers();
+        // Note: This test only validates the curated resolvers since we can't
+        // easily test async network calls in unit tests
+        let resolvers = get_stable_resolvers();
         assert!(!resolvers.is_empty());
-        assert_eq!(resolvers.len(), 31); // Should have all 31 default resolvers
+        assert_eq!(resolvers.len(), 31); // Should have all 31 curated resolvers
         
         // Verify some key resolvers are present
         assert!(resolvers.contains(&"1.1.1.1:53".parse().unwrap()));
         assert!(resolvers.contains(&"8.8.8.8:53".parse().unwrap()));
         assert!(resolvers.contains(&"9.9.9.9:53".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_trickest_download() {
+        // This test requires network access and may be flaky in CI
+        // Consider making this an integration test
+        match download_trickest_resolvers().await {
+            Ok(resolvers) => {
+                assert!(!resolvers.is_empty());
+                println!("Downloaded {} Trickest resolvers", resolvers.len());
+            }
+            Err(e) => {
+                println!("Failed to download Trickest resolvers (expected in offline environments): {}", e);
+            }
+        }
     }
 }
