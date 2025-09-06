@@ -4,10 +4,11 @@ use crate::sharding::{SocketShardPool, calculate_optimal_shards};
 use anyhow::Result;
 use dashmap::DashMap;
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -17,6 +18,88 @@ use tokio::{
 };
 use trust_dns_proto::{rr::RecordType, op::ResponseCode};
 
+/// Resolver health tracking for adaptive concurrency and failure handling
+#[derive(Debug, Clone)]
+pub struct ResolverHealth {
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub timeout_count: u64,
+    pub avg_response_time: Duration,
+    pub last_updated: Instant,
+    pub health_score: f64,
+    pub is_healthy: bool,
+}
+
+impl ResolverHealth {
+    pub fn new() -> Self {
+        Self {
+            success_count: 0,
+            failure_count: 0,
+            timeout_count: 0,
+            avg_response_time: Duration::from_millis(100),
+            last_updated: Instant::now(),
+            health_score: 1.0,
+            is_healthy: true,
+        }
+    }
+
+    pub fn update_success(&mut self, response_time: Duration) {
+        self.success_count += 1;
+        // Exponential moving average for response time
+        self.avg_response_time = Duration::from_millis(
+            ((self.avg_response_time.as_millis() as f64 * 0.9) + 
+             (response_time.as_millis() as f64 * 0.1)) as u64
+        );
+        self.last_updated = Instant::now();
+        self.recalculate_health();
+    }
+
+    pub fn update_failure(&mut self) {
+        self.failure_count += 1;
+        self.last_updated = Instant::now();
+        self.recalculate_health();
+    }
+
+    pub fn update_timeout(&mut self) {
+        self.timeout_count += 1;
+        self.last_updated = Instant::now();
+        self.recalculate_health();
+    }
+
+    fn recalculate_health(&mut self) {
+        let total_requests = self.success_count + self.failure_count + self.timeout_count;
+        if total_requests == 0 {
+            self.health_score = 1.0;
+            self.is_healthy = true;
+            return;
+        }
+
+        let success_rate = self.success_count as f64 / total_requests as f64;
+        let response_time_factor = 1.0 - (self.avg_response_time.as_millis() as f64 / 5000.0).min(1.0);
+        
+        // Health score combines success rate (80%) and response time (20%)
+        self.health_score = (success_rate * 0.8 + response_time_factor * 0.2).max(0.0).min(1.0);
+        
+        // Resolver is healthy if score > 0.5, or if new (< 100 requests) and score > 0.3
+        self.is_healthy = if total_requests < 100 {
+            self.health_score > 0.3
+        } else {
+            self.health_score > 0.5
+        };
+    }
+
+    pub fn get_adaptive_concurrency(&self, base_concurrency: usize) -> usize {
+        let factor = if self.is_healthy {
+            // Healthy resolvers get 1.0x to 2.0x concurrency based on health score
+            (self.health_score * 1.5).min(2.0)
+        } else {
+            // Unhealthy resolvers get reduced concurrency
+            0.2
+        };
+        ((base_concurrency as f64 * factor) as usize).max(1).min(base_concurrency * 2)
+    }
+}
+
 /// High-performance DNS resolution engine with socket sharding
 pub struct DnsEngine {
     args: Args,
@@ -24,6 +107,7 @@ pub struct DnsEngine {
     stats: Arc<EngineStats>,
     outstanding_queries: Arc<DashMap<u16, OutstandingQuery>>,
     socket_pool: Arc<SocketShardPool>,
+    resolver_health: Arc<Mutex<HashMap<usize, ResolverHealth>>>,
 }
 
 /// Statistics for the DNS engine
@@ -49,6 +133,7 @@ struct OutstandingQuery {
     retries_left: u32,
     result_sender: mpsc::UnboundedSender<QueryResult>,
     original_id: u16,
+    attempted_resolvers: Vec<usize>,
 }
 
 impl DnsEngine {
@@ -63,13 +148,57 @@ impl DnsEngine {
         // Create socket shard pool
         let socket_pool = Arc::new(SocketShardPool::new(num_shards, None).await?);
         
+        // Initialize resolver health tracking
+        let mut resolver_health = HashMap::new();
+        for i in 0..args.resolvers.len() {
+            resolver_health.insert(i, ResolverHealth::new());
+        }
+        
         Ok(Self {
             args,
             record_type,
             stats: Arc::new(EngineStats::default()),
             outstanding_queries: Arc::new(DashMap::new()),
             socket_pool,
+            resolver_health: Arc::new(Mutex::new(resolver_health)),
         })
+    }
+
+    /// Select the best available resolver based on health and attempted resolvers
+    fn select_best_resolver(&self, attempted_resolvers: &[usize]) -> usize {
+        let health_map = self.resolver_health.lock().unwrap();
+        let mut best_index = 0;
+        let mut best_score = -1.0;
+        
+        for (i, health) in health_map.iter() {
+            // Skip already attempted resolvers
+            if attempted_resolvers.contains(i) {
+                continue;
+            }
+            
+            let score = if health.is_healthy {
+                health.health_score
+            } else {
+                // Give unhealthy resolvers a very low score but not zero
+                // to allow them to recover
+                health.health_score * 0.1
+            };
+            
+            if score > best_score {
+                best_score = score;
+                best_index = *i;
+            }
+        }
+        
+        // If all resolvers have been attempted, start over with the healthiest
+        if best_score < 0.0 {
+            best_index = health_map.iter()
+                .max_by(|(_, a), (_, b)| a.health_score.partial_cmp(&b.health_score).unwrap())
+                .map(|(i, _)| *i)
+                .unwrap_or(0);
+        }
+        
+        best_index
     }
 
     /// Start the DNS resolution engine with sliding window concurrency
@@ -127,6 +256,7 @@ impl DnsEngine {
         let stats = self.stats.clone();
         let outstanding_queries = self.outstanding_queries.clone();
         let socket_pool = self.socket_pool.clone();
+        let resolver_health = self.resolver_health.clone();
 
         tokio::spawn(async move {
             let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
@@ -146,15 +276,16 @@ impl DnsEngine {
                             Err(_) => break, // Pipeline full
                         };
 
-                        let task = Self::spawn_single_query(
+                        let task = Self::spawn_single_query_static(
                             domain,
                             record_type,
-                            &args,
-                            &stats,
-                            &outstanding_queries,
-                            &socket_pool,
-                            &result_sender,
+                            result_sender.clone(),
                             permit,
+                            args.clone(),
+                            stats.clone(),
+                            outstanding_queries.clone(),
+                            socket_pool.clone(),
+                            resolver_health.clone(),
                         );
                         
                         active_tasks.push(task);
@@ -179,26 +310,42 @@ impl DnsEngine {
         })
     }
 
-    /// Spawn a single query task
-    fn spawn_single_query(
+    /// Spawn a single query task (static version for use in async closures)
+    fn spawn_single_query_static(
         domain: String,
         record_type: RecordType,
-        args: &Args,
-        stats: &Arc<EngineStats>,
-        outstanding_queries: &Arc<DashMap<u16, OutstandingQuery>>,
-        socket_pool: &Arc<SocketShardPool>,
-        result_sender: &mpsc::UnboundedSender<QueryResult>,
+        result_sender: mpsc::UnboundedSender<QueryResult>,
         _permit: tokio::sync::OwnedSemaphorePermit,
+        args: Args,
+        stats: Arc<EngineStats>,
+        outstanding_queries: Arc<DashMap<u16, OutstandingQuery>>,
+        socket_pool: Arc<SocketShardPool>,
+        resolver_health: Arc<Mutex<HashMap<usize, ResolverHealth>>>,
     ) -> JoinHandle<()> {
-        let args = args.clone();
-        let stats = stats.clone();
-        let outstanding_queries = outstanding_queries.clone();
-        let socket_pool = socket_pool.clone();
-        let result_sender = result_sender.clone();
 
         tokio::spawn(async move {
-            // Try each resolver in round-robin
-            let resolver_idx = stats.queries_sent.load(Ordering::Relaxed) as usize % args.resolvers.len();
+            // Select best resolver based on health (initially empty attempted list)
+            let attempted_resolvers = Vec::new();
+            let resolver_idx = {
+                let health_map = resolver_health.lock().unwrap();
+                let mut best_index = 0;
+                let mut best_score = -1.0;
+                
+                for (i, health) in health_map.iter() {
+                    let score = if health.is_healthy {
+                        health.health_score
+                    } else {
+                        health.health_score * 0.1
+                    };
+                    
+                    if score > best_score {
+                        best_score = score;
+                        best_index = *i;
+                    }
+                }
+                best_index
+            };
+            
             let resolver = args.resolvers[resolver_idx];
 
             // Select socket shard for this query
@@ -214,6 +361,7 @@ impl DnsEngine {
                 &result_sender,
                 &stats,
                 args.retries,
+                attempted_resolvers,
             ).await {
                 Ok(_) => {
                     stats.queries_sent.fetch_add(1, Ordering::Relaxed);
@@ -256,9 +404,13 @@ impl DnsEngine {
         result_sender: &mpsc::UnboundedSender<QueryResult>,
         stats: &Arc<EngineStats>,
         max_retries: u32,
+        mut attempted_resolvers: Vec<usize>,
     ) -> Result<()> {
         let packet = DnsPacket::new(domain.clone(), record_type, resolver);
         let query_data = packet.build_query()?;
+        
+        // Add this resolver to attempted list
+        attempted_resolvers.push(resolver_index);
         
         // Track the outstanding query
         let outstanding = OutstandingQuery {
@@ -270,6 +422,7 @@ impl DnsEngine {
             retries_left: max_retries,
             result_sender: result_sender.clone(),
             original_id: packet.id,
+            attempted_resolvers,
         };
         
         outstanding_queries.insert(packet.id, outstanding);
@@ -293,6 +446,7 @@ impl DnsEngine {
         let stats = self.stats.clone();
         let args = self.args.clone();
         let socket_pool = self.socket_pool.clone();
+        let resolver_health = self.resolver_health.clone();
 
         tokio::spawn(async move {
             let mut buffer = vec![0u8; 4096];
@@ -308,6 +462,7 @@ impl DnsEngine {
                             &stats,
                             &args,
                             &socket_pool,
+                            &resolver_health,
                         ).await {
                             tracing::warn!("Failed to handle response on shard {}: {}", shard_id, e);
                         }
@@ -328,6 +483,7 @@ impl DnsEngine {
         stats: &Arc<EngineStats>,
         args: &Args,
         socket_pool: &Arc<SocketShardPool>,
+        resolver_health: &Arc<Mutex<HashMap<usize, ResolverHealth>>>,
     ) -> Result<()> {
         let response = crate::packet::DnsPacket::parse_response(data)?;
         
@@ -340,8 +496,17 @@ impl DnsEngine {
             
             let domain_clone = outstanding.domain.clone();
             let response_id = response.id;
+            let resolver_idx = outstanding.resolver_index;
             
             let result = if response.is_success() {
+                // Update resolver health with success
+                {
+                    let mut health_map = resolver_health.lock().unwrap();
+                    if let Some(health) = health_map.get_mut(&resolver_idx) {
+                        health.update_success(elapsed);
+                    }
+                }
+                
                 stats.successful_resolutions.fetch_add(1, Ordering::Relaxed);
                 QueryResult::success(
                     outstanding.domain,
@@ -351,6 +516,13 @@ impl DnsEngine {
                     elapsed_ms,
                 )
             } else {
+                // Update resolver health with failure
+                {
+                    let mut health_map = resolver_health.lock().unwrap();
+                    if let Some(health) = health_map.get_mut(&resolver_idx) {
+                        health.update_failure();
+                    }
+                }
                 // Check if we should retry based on response code
                 let should_retry = match response.response_code {
                     ResponseCode::ServFail |
@@ -360,12 +532,48 @@ impl DnsEngine {
                 };
 
                 if should_retry && outstanding.retries_left > 0 {
-                    // Retry with a different resolver
-                    let next_resolver_index = (outstanding.resolver_index + 1) % args.resolvers.len();
+                    // Select best resolver based on health and attempted resolvers
+                    let next_resolver_index = {
+                        let health_map = resolver_health.lock().unwrap();
+                        let mut best_index = 0;
+                        let mut best_score = -1.0;
+                        
+                        for (i, health) in health_map.iter() {
+                            // Skip already attempted resolvers
+                            if outstanding.attempted_resolvers.contains(i) {
+                                continue;
+                            }
+                            
+                            let score = if health.is_healthy {
+                                health.health_score
+                            } else {
+                                health.health_score * 0.1
+                            };
+                            
+                            if score > best_score {
+                                best_score = score;
+                                best_index = *i;
+                            }
+                        }
+                        
+                        // If all resolvers have been attempted, start over with the healthiest
+                        if best_score < 0.0 {
+                            best_index = health_map.iter()
+                                .max_by(|(_, a), (_, b)| a.health_score.partial_cmp(&b.health_score).unwrap())
+                                .map(|(i, _)| *i)
+                                .unwrap_or(0);
+                        }
+                        
+                        best_index
+                    };
+                    
                     let next_resolver = args.resolvers[next_resolver_index];
                     
                     // Create retry query with new ID and different resolver
                     let retry_id = next_query_id();
+                    let mut new_attempted = outstanding.attempted_resolvers.clone();
+                    new_attempted.push(next_resolver_index);
+                    
                     let retry_outstanding = OutstandingQuery {
                         domain: outstanding.domain.clone(),
                         record_type: outstanding.record_type,
@@ -375,6 +583,7 @@ impl DnsEngine {
                         retries_left: outstanding.retries_left - 1,
                         result_sender: outstanding.result_sender.clone(),
                         original_id: outstanding.original_id,
+                        attempted_resolvers: new_attempted,
                     };
                     
                     // Build and send the retry query
@@ -450,6 +659,7 @@ impl DnsEngine {
         let stats = self.stats.clone();
         let args = self.args.clone();
         let socket_pool = self.socket_pool.clone();
+        let resolver_health = self.resolver_health.clone();
         let timeout_duration = Duration::from_millis(self.args.timeout);
 
         tokio::spawn(async move {
@@ -474,15 +684,58 @@ impl DnsEngine {
                 // Handle timeouts
                 for query_id in timed_out {
                     if let Some((_, outstanding)) = outstanding_queries.remove(&query_id) {
+                        // Update resolver health with timeout
+                        {
+                            let mut health_map = resolver_health.lock().unwrap();
+                            if let Some(health) = health_map.get_mut(&outstanding.resolver_index) {
+                                health.update_timeout();
+                            }
+                        }
+                        
                         stats.timeouts.fetch_add(1, Ordering::Relaxed);
                         stats.in_flight.fetch_sub(1, Ordering::Relaxed);
                         
                         // Try retry with different resolver if retries are available
                         if outstanding.retries_left > 0 {
-                            let next_resolver_index = (outstanding.resolver_index + 1) % args.resolvers.len();
+                            // Select best resolver based on health and attempted resolvers
+                            let next_resolver_index = {
+                                let health_map = resolver_health.lock().unwrap();
+                                let mut best_index = 0;
+                                let mut best_score = -1.0;
+                                
+                                for (i, health) in health_map.iter() {
+                                    if outstanding.attempted_resolvers.contains(i) {
+                                        continue;
+                                    }
+                                    
+                                    let score = if health.is_healthy {
+                                        health.health_score
+                                    } else {
+                                        health.health_score * 0.1
+                                    };
+                                    
+                                    if score > best_score {
+                                        best_score = score;
+                                        best_index = *i;
+                                    }
+                                }
+                                
+                                if best_score < 0.0 {
+                                    best_index = health_map.iter()
+                                        .max_by(|(_, a), (_, b)| a.health_score.partial_cmp(&b.health_score).unwrap())
+                                        .map(|(i, _)| *i)
+                                        .unwrap_or(0);
+                                }
+                                
+                                best_index
+                            };
+                            
                             let next_resolver = args.resolvers[next_resolver_index];
                             
                             let retry_id = next_query_id();
+                            let mut new_attempted = outstanding.attempted_resolvers.clone();
+                            new_attempted.push(next_resolver_index);
+                            
                             let retry_outstanding = OutstandingQuery {
                                 domain: outstanding.domain.clone(),
                                 record_type: outstanding.record_type,
@@ -492,6 +745,7 @@ impl DnsEngine {
                                 retries_left: outstanding.retries_left - 1,
                                 result_sender: outstanding.result_sender.clone(),
                                 original_id: outstanding.original_id,
+                                attempted_resolvers: new_attempted,
                             };
                             
                             // Try to send retry query
@@ -545,6 +799,8 @@ impl DnsEngine {
     /// Spawn stats reporter
     fn spawn_stats_reporter(&self) -> JoinHandle<()> {
         let stats = self.stats.clone();
+        let resolver_health = self.resolver_health.clone();
+        let args = self.args.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -556,13 +812,39 @@ impl DnsEngine {
                 let received = stats.responses_received.load(Ordering::Relaxed);
                 let successful = stats.successful_resolutions.load(Ordering::Relaxed);
                 let timeouts = stats.timeouts.load(Ordering::Relaxed);
+                let retries = stats.retries.load(Ordering::Relaxed);
                 let in_flight = stats.in_flight.load(Ordering::Relaxed);
                 let malformed = stats.malformed_domains.load(Ordering::Relaxed);
                 
                 tracing::info!(
-                    "📊 Stats: sent={}, received={}, successful={}, timeouts={}, in_flight={}, malformed={}",
-                    sent, received, successful, timeouts, in_flight, malformed
+                    "📊 Stats: sent={}, received={}, successful={}, timeouts={}, retries={}, in_flight={}, malformed={}",
+                    sent, received, successful, timeouts, retries, in_flight, malformed
                 );
+                
+                // Log resolver health summary
+                {
+                    let health_map = resolver_health.lock().unwrap();
+                    let healthy_count = health_map.values().filter(|h| h.is_healthy).count();
+                    let total_resolvers = args.resolvers.len();
+                    
+                    tracing::info!(
+                        "🏥 Resolver Health: {}/{} healthy resolvers", 
+                        healthy_count, total_resolvers
+                    );
+                    
+                    // Log top 5 healthiest and worst resolvers
+                    let mut sorted_health: Vec<_> = health_map.iter().collect();
+                    sorted_health.sort_by(|a, b| b.1.health_score.partial_cmp(&a.1.health_score).unwrap());
+                    
+                    for (i, (idx, health)) in sorted_health.iter().take(3).enumerate() {
+                        let resolver = args.resolvers[**idx];
+                        tracing::debug!(
+                            "Top {}: {} (score: {:.2}, success: {}, timeouts: {}, avg_ms: {})",
+                            i + 1, resolver, health.health_score, health.success_count,
+                            health.timeout_count, health.avg_response_time.as_millis()
+                        );
+                    }
+                }
             }
         })
     }
@@ -578,5 +860,22 @@ impl DnsEngine {
             in_flight: AtomicUsize::new(self.stats.in_flight.load(Ordering::Relaxed)),
             malformed_domains: AtomicU64::new(self.stats.malformed_domains.load(Ordering::Relaxed)),
         }
+    }
+
+    /// Get resolver health summary for final reporting
+    pub fn get_resolver_health_summary(&self) -> Vec<(SocketAddr, ResolverHealth)> {
+        let health_map = self.resolver_health.lock().unwrap();
+        let mut summary = Vec::new();
+        
+        for (idx, health) in health_map.iter() {
+            if *idx < self.args.resolvers.len() {
+                let resolver = self.args.resolvers[*idx];
+                summary.push((resolver, health.clone()));
+            }
+        }
+        
+        // Sort by health score descending
+        summary.sort_by(|a, b| b.1.health_score.partial_cmp(&a.1.health_score).unwrap());
+        summary
     }
 }

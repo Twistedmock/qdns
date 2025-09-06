@@ -146,11 +146,41 @@ async fn main() -> Result<()> {
           total_results, total_results as f64 / elapsed.as_secs_f64());
     info!("🎯 Successful resolutions: {} ({:.1}%)", 
           successful_results, (successful_results as f64 / total_results as f64) * 100.0);
-    info!("📊 Engine stats: sent={}, received={}, timeouts={}, malformed={}", 
+    info!("📊 Engine stats: sent={}, received={}, timeouts={}, retries={}, malformed={}", 
           stats.queries_sent.load(std::sync::atomic::Ordering::Relaxed),
           stats.responses_received.load(std::sync::atomic::Ordering::Relaxed),
           stats.timeouts.load(std::sync::atomic::Ordering::Relaxed),
+          stats.retries.load(std::sync::atomic::Ordering::Relaxed),
           stats.malformed_domains.load(std::sync::atomic::Ordering::Relaxed));
+
+    // Print resolver health summary if verbose
+    if args.verbose {
+        let health_summary = engine.get_resolver_health_summary();
+        let healthy_count = health_summary.iter().filter(|(_, h)| h.is_healthy).count();
+        
+        info!("🏥 Resolver Health Summary: {}/{} healthy", healthy_count, health_summary.len());
+        
+        // Show top 5 and bottom 5 resolvers
+        for (i, (resolver, health)) in health_summary.iter().take(5).enumerate() {
+            info!("  #{}: {} - Score: {:.2} (Success: {}, Timeouts: {}, Avg: {}ms)", 
+                  i + 1, resolver, health.health_score, health.success_count, 
+                  health.timeout_count, health.avg_response_time.as_millis());
+        }
+        
+        if health_summary.len() > 10 {
+            info!("  ... {} more resolvers in middle ...", health_summary.len() - 10);
+        }
+        
+        // Show worst 5 resolvers
+        let worst_start = health_summary.len().saturating_sub(5);
+        if worst_start > 5 {
+            for (resolver, health) in health_summary.iter().skip(worst_start) {
+                info!("  Worst: {} - Score: {:.2} (Success: {}, Timeouts: {}, Avg: {}ms)", 
+                      resolver, health.health_score, health.success_count, 
+                      health.timeout_count, health.avg_response_time.as_millis());
+            }
+        }
+    }
 
     Ok(())
 }

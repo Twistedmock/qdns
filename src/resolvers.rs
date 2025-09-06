@@ -3,12 +3,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{info, warn, error};
 
-const RESOLVERS_URL: &str = "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt";
+const RESOLVERS_URL: &str = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers-trusted.txt";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Download and parse resolvers from the Trickest resolvers list
 pub async fn download_resolvers() -> Result<Vec<SocketAddr>> {
-    info!("📡 Downloading resolvers from {}", RESOLVERS_URL);
+    info!("📡 Downloading trusted resolvers from {}", RESOLVERS_URL);
     
     let client = reqwest::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
@@ -36,7 +36,7 @@ pub async fn download_resolvers() -> Result<Vec<SocketAddr>> {
     
     let resolvers = parse_resolvers(&content)?;
     
-    info!("✅ Downloaded {} resolvers from Trickest list", resolvers.len());
+    info!("✅ Downloaded {} resolvers from Trickest trusted list", resolvers.len());
     
     Ok(resolvers)
 }
