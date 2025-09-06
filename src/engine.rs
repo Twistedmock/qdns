@@ -15,7 +15,7 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
-use trust_dns_proto::rr::RecordType;
+use trust_dns_proto::{rr::RecordType, op::ResponseCode};
 
 /// High-performance DNS resolution engine with socket sharding
 pub struct DnsEngine {
@@ -44,6 +44,7 @@ struct OutstandingQuery {
     domain: String,
     record_type: RecordType,
     resolver: SocketAddr,
+    resolver_index: usize,
     start_time: Instant,
     retries_left: u32,
     result_sender: mpsc::UnboundedSender<QueryResult>,
@@ -207,6 +208,7 @@ impl DnsEngine {
                 domain.clone(),
                 record_type,
                 resolver,
+                resolver_idx,
                 &shard.socket,
                 &outstanding_queries,
                 &result_sender,
@@ -248,6 +250,7 @@ impl DnsEngine {
         domain: String,
         record_type: RecordType,
         resolver: SocketAddr,
+        resolver_index: usize,
         socket: &Arc<tokio::net::UdpSocket>,
         outstanding_queries: &Arc<DashMap<u16, OutstandingQuery>>,
         result_sender: &mpsc::UnboundedSender<QueryResult>,
@@ -262,6 +265,7 @@ impl DnsEngine {
             domain: packet.domain.clone(),
             record_type: packet.record_type,
             resolver: packet.resolver,
+            resolver_index,
             start_time: Instant::now(),
             retries_left: max_retries,
             result_sender: result_sender.clone(),
@@ -288,6 +292,7 @@ impl DnsEngine {
         let outstanding_queries = self.outstanding_queries.clone();
         let stats = self.stats.clone();
         let args = self.args.clone();
+        let socket_pool = self.socket_pool.clone();
 
         tokio::spawn(async move {
             let mut buffer = vec![0u8; 4096];
@@ -302,6 +307,7 @@ impl DnsEngine {
                             &outstanding_queries,
                             &stats,
                             &args,
+                            &socket_pool,
                         ).await {
                             tracing::warn!("Failed to handle response on shard {}: {}", shard_id, e);
                         }
@@ -320,7 +326,8 @@ impl DnsEngine {
         data: &[u8],
         outstanding_queries: &Arc<DashMap<u16, OutstandingQuery>>,
         stats: &Arc<EngineStats>,
-        _args: &Args,
+        args: &Args,
+        socket_pool: &Arc<SocketShardPool>,
     ) -> Result<()> {
         let response = crate::packet::DnsPacket::parse_response(data)?;
         
@@ -344,26 +351,60 @@ impl DnsEngine {
                     elapsed_ms,
                 )
             } else {
-                // Check if we should retry
-                if outstanding.retries_left > 0 {
-                    stats.retries.fetch_add(1, Ordering::Relaxed);
+                // Check if we should retry based on response code
+                let should_retry = match response.response_code {
+                    ResponseCode::ServFail |
+                    ResponseCode::Refused |
+                    ResponseCode::FormErr => true,
+                    _ => false,
+                };
+
+                if should_retry && outstanding.retries_left > 0 {
+                    // Retry with a different resolver
+                    let next_resolver_index = (outstanding.resolver_index + 1) % args.resolvers.len();
+                    let next_resolver = args.resolvers[next_resolver_index];
                     
-                    // Create retry query with new ID
+                    // Create retry query with new ID and different resolver
                     let retry_id = next_query_id();
                     let retry_outstanding = OutstandingQuery {
                         domain: outstanding.domain.clone(),
                         record_type: outstanding.record_type,
-                        resolver: outstanding.resolver,
-                        start_time: outstanding.start_time,
+                        resolver: next_resolver,
+                        resolver_index: next_resolver_index,
+                        start_time: Instant::now(), // Reset timer for retry
                         retries_left: outstanding.retries_left - 1,
                         result_sender: outstanding.result_sender.clone(),
                         original_id: outstanding.original_id,
                     };
                     
-                    outstanding_queries.insert(retry_id, retry_outstanding);
-                    
-                    // Note: The actual retry sending would need to be implemented
-                    // For now, just treat as error
+                    // Build and send the retry query
+                    match Self::send_retry_query(
+                        retry_outstanding.domain.clone(),
+                        retry_outstanding.record_type,
+                        next_resolver,
+                        retry_id,
+                    ).await {
+                        Ok(query_data) => {
+                            // Track the retry query
+                            outstanding_queries.insert(retry_id, retry_outstanding);
+                            stats.retries.fetch_add(1, Ordering::Relaxed);
+                            stats.in_flight.fetch_add(1, Ordering::Relaxed);
+                            
+                            // Send the query using a socket from the pool
+                            let shard = socket_pool.get_shard();
+                            if shard.socket.send_to(&query_data, next_resolver).await.is_ok() {
+                                // Retry was successful, don't send error result yet
+                                return Ok(());
+                            } else {
+                                // Failed to send retry, clean up and proceed to error result
+                                outstanding_queries.remove(&retry_id);
+                                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => {
+                            // Failed to build retry query, proceed to error result
+                        }
+                    }
                 }
                 
                 QueryResult::error(
@@ -390,10 +431,25 @@ impl DnsEngine {
         Ok(())
     }
 
+    /// Build query packet for retry
+    async fn send_retry_query(
+        domain: String,
+        record_type: RecordType,
+        resolver: SocketAddr,
+        query_id: u16,
+    ) -> Result<Vec<u8>> {
+        let mut packet = crate::packet::DnsPacket::new(domain, record_type, resolver);
+        packet.id = query_id; // Use the provided retry ID
+        let bytes = packet.build_query()?;
+        Ok(bytes.to_vec())
+    }
+
     /// Spawn timeout handler
     fn spawn_timeout_handler(&self) -> JoinHandle<()> {
         let outstanding_queries = self.outstanding_queries.clone();
         let stats = self.stats.clone();
+        let args = self.args.clone();
+        let socket_pool = self.socket_pool.clone();
         let timeout_duration = Duration::from_millis(self.args.timeout);
 
         tokio::spawn(async move {
@@ -421,6 +477,54 @@ impl DnsEngine {
                         stats.timeouts.fetch_add(1, Ordering::Relaxed);
                         stats.in_flight.fetch_sub(1, Ordering::Relaxed);
                         
+                        // Try retry with different resolver if retries are available
+                        if outstanding.retries_left > 0 {
+                            let next_resolver_index = (outstanding.resolver_index + 1) % args.resolvers.len();
+                            let next_resolver = args.resolvers[next_resolver_index];
+                            
+                            let retry_id = next_query_id();
+                            let retry_outstanding = OutstandingQuery {
+                                domain: outstanding.domain.clone(),
+                                record_type: outstanding.record_type,
+                                resolver: next_resolver,
+                                resolver_index: next_resolver_index,
+                                start_time: Instant::now(),
+                                retries_left: outstanding.retries_left - 1,
+                                result_sender: outstanding.result_sender.clone(),
+                                original_id: outstanding.original_id,
+                            };
+                            
+                            // Try to send retry query
+                            match Self::send_retry_query(
+                                retry_outstanding.domain.clone(),
+                                retry_outstanding.record_type,
+                                next_resolver,
+                                retry_id,
+                            ).await {
+                                Ok(query_data) => {
+                                    // Track the retry query
+                                    outstanding_queries.insert(retry_id, retry_outstanding);
+                                    stats.retries.fetch_add(1, Ordering::Relaxed);
+                                    stats.in_flight.fetch_add(1, Ordering::Relaxed);
+                                    
+                                    // Send the query
+                                    let shard = socket_pool.get_shard();
+                                    if shard.socket.send_to(&query_data, next_resolver).await.is_ok() {
+                                        // Retry was successful, continue without sending error
+                                        continue;
+                                    } else {
+                                        // Failed to send retry, clean up and proceed to timeout error
+                                        outstanding_queries.remove(&retry_id);
+                                        stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(_) => {
+                                    // Failed to build retry query, proceed to timeout error
+                                }
+                            }
+                        }
+                        
+                        // No retries left or retry failed, send timeout error
                         let elapsed_ms = outstanding.start_time.elapsed().as_millis() as u64;
                         
                         let result = QueryResult::error(
