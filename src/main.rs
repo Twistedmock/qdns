@@ -109,14 +109,13 @@ async fn main() -> Result<()> {
                 
                 output_writer.write_all(output_line.as_bytes()).await?;
             }
-        } else if !args.success_only {
-            // Output failed resolutions if not in success-only mode
-            if args.verbose {
-                let error_msg = result.error.as_deref().unwrap_or("Unknown error");
-                let output_line = format!("{} ERROR {} {}ms\n", result.domain, error_msg, result.elapsed_ms);
-                output_writer.write_all(output_line.as_bytes()).await?;
-            }
+        } else if args.verbose {
+            // Log failed resolutions to stderr for debugging (not to output file)
+            let error_msg = result.error.as_deref().unwrap_or("Unknown error");
+            tracing::debug!("Failed: {} - {} ({}ms)", result.domain, error_msg, result.elapsed_ms);
         }
+        // Note: Failed resolutions are NOT written to output file
+        // They are only logged to stderr in verbose mode for debugging
 
         // Flush output periodically
         if total_results % 1000 == 0 {
