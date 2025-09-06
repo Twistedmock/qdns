@@ -14,11 +14,12 @@ pub struct Args {
 
     /// DNS resolvers to use (can be specified multiple times)
     /// 
-    /// Default: Uses a curated set of 8 stable public DNS resolvers:
+    /// Default: Uses a curated set of 31 stable public DNS resolvers including:
     /// - Cloudflare: 1.1.1.1, 1.0.0.1
     /// - Google: 8.8.8.8, 8.8.4.4  
     /// - Quad9: 9.9.9.9, 149.112.112.112
     /// - OpenDNS: 208.67.222.222, 208.67.220.220
+    /// - Plus 23 additional high-performance resolvers for redundancy
     /// 
     /// For maximum performance, run a local recursive resolver like:
     /// - Unbound: https://unbound.docs.nlnetlabs.nl/

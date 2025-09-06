@@ -5,14 +5,46 @@ use tracing::{info, warn, error};
 /// Default stable resolver set for high-performance DNS resolution
 /// These are carefully curated for reliability and performance
 const DEFAULT_RESOLVERS: &[&str] = &[
-    "1.1.1.1:53",          // Cloudflare Primary
-    "1.0.0.1:53",          // Cloudflare Secondary
-    "8.8.8.8:53",          // Google Primary
-    "8.8.4.4:53",          // Google Secondary
-    "9.9.9.9:53",          // Quad9 Primary
-    "149.112.112.112:53",  // Quad9 Secondary
-    "208.67.222.222:53",   // OpenDNS Primary
-    "208.67.220.220:53",   // OpenDNS Secondary
+    // Cloudflare
+    "1.1.1.1:53",
+    "1.0.0.1:53",
+    
+    // Google Public DNS
+    "8.8.8.8:53",
+    "8.8.4.4:53",
+    
+    // Quad9
+    "9.9.9.9:53",
+    "149.112.112.112:53",
+    
+    // OpenDNS
+    "208.67.222.222:53",
+    "208.67.220.220:53",
+    
+    // Additional high-performance resolvers
+    "134.195.4.2:53",      // DNS.SB
+    "159.89.120.99:53",    // DigitalOcean
+    "185.228.168.9:53",    // CleanBrowsing
+    "185.228.169.9:53",    // CleanBrowsing Secondary
+    "195.46.39.39:53",     // SafeDNS
+    "195.46.39.40:53",     // SafeDNS Secondary
+    "205.171.2.65:53",     // CenturyLink
+    "205.171.3.65:53",     // CenturyLink Secondary
+    "216.146.35.35:53",    // Dyn
+    "216.146.36.36:53",    // Dyn Secondary
+    "64.6.64.6:53",        // Verisign
+    "64.6.65.6:53",        // Verisign Secondary
+    "74.82.42.42:53",      // Hurricane Electric
+    "76.76.10.0:53",       // Control D
+    "76.76.2.0:53",        // Control D Secondary
+    "77.88.8.1:53",        // Yandex
+    "77.88.8.8:53",        // Yandex Secondary
+    "8.20.247.20:53",      // Comodo Secure
+    "8.26.56.26:53",       // Comodo Secure Secondary
+    "84.200.69.80:53",     // DNS.WATCH
+    "84.200.70.40:53",     // DNS.WATCH Secondary
+    "89.233.43.71:53",     // UncensoredDNS
+    "91.239.100.100:53",   // UncensoredDNS Secondary
 ];
 
 /// Get default stable resolvers with fallback parsing
@@ -131,7 +163,7 @@ invalid-ip
     fn test_default_resolvers() {
         let resolvers = get_default_resolvers();
         assert!(!resolvers.is_empty());
-        assert_eq!(resolvers.len(), 8); // Should have all 8 default resolvers
+        assert_eq!(resolvers.len(), 31); // Should have all 31 default resolvers
         
         // Verify some key resolvers are present
         assert!(resolvers.contains(&"1.1.1.1:53".parse().unwrap()));
