@@ -28,6 +28,7 @@ pub struct ResolverHealth {
     pub last_updated: Instant,
     pub health_score: f64,
     pub is_healthy: bool,
+    pub consecutive_failures: u32,
 }
 
 impl ResolverHealth {
@@ -40,11 +41,14 @@ impl ResolverHealth {
             last_updated: Instant::now(),
             health_score: 1.0,
             is_healthy: true,
+            consecutive_failures: 0,
         }
     }
 
     pub fn update_success(&mut self, response_time: Duration) {
         self.success_count += 1;
+        self.consecutive_failures = 0; // Reset consecutive failures on success
+        
         // Exponential moving average for response time
         self.avg_response_time = Duration::from_millis(
             ((self.avg_response_time.as_millis() as f64 * 0.9) + 
@@ -56,12 +60,14 @@ impl ResolverHealth {
 
     pub fn update_failure(&mut self) {
         self.failure_count += 1;
+        self.consecutive_failures += 1;
         self.last_updated = Instant::now();
         self.recalculate_health();
     }
 
     pub fn update_timeout(&mut self) {
         self.timeout_count += 1;
+        self.consecutive_failures += 1;
         self.last_updated = Instant::now();
         self.recalculate_health();
     }
@@ -80,11 +86,12 @@ impl ResolverHealth {
         // Health score combines success rate (80%) and response time (20%)
         self.health_score = (success_rate * 0.8 + response_time_factor * 0.2).max(0.0).min(1.0);
         
-        // Resolver is healthy if score > 0.5, or if new (< 100 requests) and score > 0.3
-        self.is_healthy = if total_requests < 100 {
-            self.health_score > 0.3
+        // Mark unhealthy if success rate < 20% OR too many consecutive failures
+        self.is_healthy = if total_requests < 10 {
+            // Be lenient for new resolvers
+            success_rate > 0.1 && self.consecutive_failures < 10
         } else {
-            self.health_score > 0.5
+            success_rate > 0.2 && self.consecutive_failures < 20
         };
     }
 
@@ -100,6 +107,182 @@ impl ResolverHealth {
     }
 }
 
+/// Resolver pool with rotation and adaptive concurrency
+#[derive(Debug)]
+pub struct ResolverPool {
+    resolvers: Vec<SocketAddr>,
+    health: Arc<Mutex<HashMap<usize, ResolverHealth>>>,
+    round_robin_counter: Arc<AtomicUsize>,
+    total_concurrency: usize,
+    per_resolver_base_concurrency: usize,
+    max_single_resolver_concurrency: usize,
+}
+
+impl ResolverPool {
+    pub fn new(resolvers: Vec<SocketAddr>, total_concurrency: usize) -> Self {
+        let resolver_count = resolvers.len();
+        let per_resolver_base = if resolver_count > 0 {
+            total_concurrency / resolver_count
+        } else {
+            1000
+        };
+        
+        // Cap individual resolver concurrency for safety
+        let max_single = if resolver_count == 1 {
+            2000 // Safe limit for single resolver
+        } else {
+            total_concurrency / 2 // Max half total concurrency per resolver
+        };
+        
+        let mut health = HashMap::new();
+        for i in 0..resolver_count {
+            health.insert(i, ResolverHealth::new());
+        }
+        
+        tracing::info!(
+            "🔄 Resolver pool initialized: {} resolvers, {} base concurrency per resolver, {} max per resolver",
+            resolver_count, per_resolver_base, max_single
+        );
+        
+        Self {
+            resolvers,
+            health: Arc::new(Mutex::new(health)),
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            total_concurrency,
+            per_resolver_base_concurrency: per_resolver_base,
+            max_single_resolver_concurrency: max_single,
+        }
+    }
+    
+    /// Select next resolver using round-robin with health checks
+    pub fn select_resolver(&self) -> (usize, SocketAddr) {
+        if self.resolvers.is_empty() {
+            panic!("No resolvers available");
+        }
+        
+        let health_map = self.health.lock().unwrap();
+        
+        // First try round-robin among healthy resolvers
+        let start_idx = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % self.resolvers.len();
+        
+        for offset in 0..self.resolvers.len() {
+            let idx = (start_idx + offset) % self.resolvers.len();
+            if let Some(health) = health_map.get(&idx) {
+                if health.is_healthy {
+                    return (idx, self.resolvers[idx]);
+                }
+            }
+        }
+        
+        // If no healthy resolvers, fall back to best available
+        let best_idx = health_map.iter()
+            .max_by(|(_, a), (_, b)| a.health_score.partial_cmp(&b.health_score).unwrap())
+            .map(|(i, _)| *i)
+            .unwrap_or(0);
+            
+        (best_idx, self.resolvers[best_idx])
+    }
+    
+    /// Select best resolver excluding already attempted ones (for retries)
+    pub fn select_best_excluding(&self, excluded: &[usize]) -> Option<(usize, SocketAddr)> {
+        let health_map = self.health.lock().unwrap();
+        
+        let mut best_idx = None;
+        let mut best_score = -1.0;
+        
+        for (idx, health) in health_map.iter() {
+            if excluded.contains(idx) {
+                continue;
+            }
+            
+            let score = if health.is_healthy {
+                health.health_score
+            } else {
+                health.health_score * 0.1 // Give unhealthy resolvers low but non-zero chance
+            };
+            
+            if score > best_score {
+                best_score = score;
+                best_idx = Some(*idx);
+            }
+        }
+        
+        best_idx.map(|idx| (idx, self.resolvers[idx]))
+    }
+    
+    /// Get adaptive concurrency for a specific resolver
+    pub fn get_resolver_concurrency(&self, resolver_idx: usize) -> usize {
+        let health_map = self.health.lock().unwrap();
+        if let Some(health) = health_map.get(&resolver_idx) {
+            let adaptive = health.get_adaptive_concurrency(self.per_resolver_base_concurrency);
+            adaptive.min(self.max_single_resolver_concurrency)
+        } else {
+            self.per_resolver_base_concurrency
+        }
+    }
+    
+    /// Update resolver health stats
+    pub fn update_resolver_success(&self, resolver_idx: usize, response_time: Duration) {
+        let mut health_map = self.health.lock().unwrap();
+        if let Some(health) = health_map.get_mut(&resolver_idx) {
+            health.update_success(response_time);
+        }
+    }
+    
+    pub fn update_resolver_failure(&self, resolver_idx: usize) {
+        let mut health_map = self.health.lock().unwrap();
+        if let Some(health) = health_map.get_mut(&resolver_idx) {
+            health.update_failure();
+        }
+    }
+    
+    pub fn update_resolver_timeout(&self, resolver_idx: usize) {
+        let mut health_map = self.health.lock().unwrap();
+        if let Some(health) = health_map.get_mut(&resolver_idx) {
+            health.update_timeout();
+        }
+    }
+    
+    /// Get health summary for all resolvers
+    pub fn get_health_summary(&self) -> Vec<(SocketAddr, ResolverHealth)> {
+        let health_map = self.health.lock().unwrap();
+        let mut summary = Vec::new();
+        
+        for (idx, health) in health_map.iter() {
+            if *idx < self.resolvers.len() {
+                summary.push((self.resolvers[*idx], health.clone()));
+            }
+        }
+        
+        // Sort by health score descending
+        summary.sort_by(|a, b| b.1.health_score.partial_cmp(&a.1.health_score).unwrap());
+        summary
+    }
+    
+    /// Get count of healthy resolvers
+    pub fn healthy_resolver_count(&self) -> usize {
+        let health_map = self.health.lock().unwrap();
+        health_map.values().filter(|h| h.is_healthy).count()
+    }
+    
+    /// Log dropped resolvers (those with very low success rates)
+    pub fn log_dropped_resolvers(&self) {
+        let health_map = self.health.lock().unwrap();
+        for (idx, health) in health_map.iter() {
+            if !health.is_healthy && health.success_count + health.failure_count + health.timeout_count > 50 {
+                let total = health.success_count + health.failure_count + health.timeout_count;
+                let success_rate = health.success_count as f64 / total as f64;
+                if success_rate < 0.2 {
+                    tracing::warn!(
+                        "🚫 Resolver {} dropped: {:.1}% success rate ({}/{} requests)",
+                        self.resolvers[*idx], success_rate * 100.0, health.success_count, total
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// High-performance DNS resolution engine with socket sharding
 pub struct DnsEngine {
     args: Args,
@@ -107,7 +290,7 @@ pub struct DnsEngine {
     stats: Arc<EngineStats>,
     outstanding_queries: Arc<DashMap<u16, OutstandingQuery>>,
     socket_pool: Arc<SocketShardPool>,
-    resolver_health: Arc<Mutex<HashMap<usize, ResolverHealth>>>,
+    resolver_pool: Arc<ResolverPool>,
 }
 
 /// Statistics for the DNS engine
@@ -122,7 +305,7 @@ pub struct EngineStats {
     pub malformed_domains: AtomicU64,
 }
 
-/// Outstanding query tracking with retry logic
+/// Outstanding query tracking with retry logic and exponential backoff
 #[derive(Debug)]
 struct OutstandingQuery {
     domain: String,
@@ -134,6 +317,14 @@ struct OutstandingQuery {
     result_sender: mpsc::UnboundedSender<QueryResult>,
     original_id: u16,
     attempted_resolvers: Vec<usize>,
+    retry_delay_ms: u64, // Exponential backoff delay
+}
+
+/// Calculate exponential backoff delay for retries
+fn calculate_backoff_delay(retry_attempt: u32) -> Duration {
+    let base_delay_ms = 50; // Start with 50ms
+    let delay_ms = base_delay_ms * (2_u64.pow(retry_attempt)).min(1000); // Cap at 1000ms
+    Duration::from_millis(delay_ms)
 }
 
 impl DnsEngine {
@@ -148,11 +339,8 @@ impl DnsEngine {
         // Create socket shard pool
         let socket_pool = Arc::new(SocketShardPool::new(num_shards, None).await?);
         
-        // Initialize resolver health tracking
-        let mut resolver_health = HashMap::new();
-        for i in 0..args.resolvers.len() {
-            resolver_health.insert(i, ResolverHealth::new());
-        }
+        // Create resolver pool with adaptive concurrency
+        let resolver_pool = Arc::new(ResolverPool::new(args.resolvers.clone(), concurrency));
         
         Ok(Self {
             args,
@@ -160,45 +348,13 @@ impl DnsEngine {
             stats: Arc::new(EngineStats::default()),
             outstanding_queries: Arc::new(DashMap::new()),
             socket_pool,
-            resolver_health: Arc::new(Mutex::new(resolver_health)),
+            resolver_pool,
         })
     }
 
-    /// Select the best available resolver based on health and attempted resolvers
-    fn select_best_resolver(&self, attempted_resolvers: &[usize]) -> usize {
-        let health_map = self.resolver_health.lock().unwrap();
-        let mut best_index = 0;
-        let mut best_score = -1.0;
-        
-        for (i, health) in health_map.iter() {
-            // Skip already attempted resolvers
-            if attempted_resolvers.contains(i) {
-                continue;
-            }
-            
-            let score = if health.is_healthy {
-                health.health_score
-            } else {
-                // Give unhealthy resolvers a very low score but not zero
-                // to allow them to recover
-                health.health_score * 0.1
-            };
-            
-            if score > best_score {
-                best_score = score;
-                best_index = *i;
-            }
-        }
-        
-        // If all resolvers have been attempted, start over with the healthiest
-        if best_score < 0.0 {
-            best_index = health_map.iter()
-                .max_by(|(_, a), (_, b)| a.health_score.partial_cmp(&b.health_score).unwrap())
-                .map(|(i, _)| *i)
-                .unwrap_or(0);
-        }
-        
-        best_index
+    /// Select the best available resolver for retry based on health and attempted resolvers
+    fn select_best_resolver_for_retry(&self, attempted_resolvers: &[usize]) -> Option<(usize, SocketAddr)> {
+        self.resolver_pool.select_best_excluding(attempted_resolvers)
     }
 
     /// Start the DNS resolution engine with sliding window concurrency
@@ -256,7 +412,7 @@ impl DnsEngine {
         let stats = self.stats.clone();
         let outstanding_queries = self.outstanding_queries.clone();
         let socket_pool = self.socket_pool.clone();
-        let resolver_health = self.resolver_health.clone();
+        let resolver_pool = self.resolver_pool.clone();
 
         tokio::spawn(async move {
             let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
@@ -285,7 +441,7 @@ impl DnsEngine {
                             stats.clone(),
                             outstanding_queries.clone(),
                             socket_pool.clone(),
-                            resolver_health.clone(),
+                            resolver_pool.clone(),
                         );
                         
                         active_tasks.push(task);
@@ -320,33 +476,13 @@ impl DnsEngine {
         stats: Arc<EngineStats>,
         outstanding_queries: Arc<DashMap<u16, OutstandingQuery>>,
         socket_pool: Arc<SocketShardPool>,
-        resolver_health: Arc<Mutex<HashMap<usize, ResolverHealth>>>,
+        resolver_pool: Arc<ResolverPool>,
     ) -> JoinHandle<()> {
 
         tokio::spawn(async move {
-            // Select best resolver based on health (initially empty attempted list)
-            let attempted_resolvers = Vec::new();
-            let resolver_idx = {
-                let health_map = resolver_health.lock().unwrap();
-                let mut best_index = 0;
-                let mut best_score = -1.0;
-                
-                for (i, health) in health_map.iter() {
-                    let score = if health.is_healthy {
-                        health.health_score
-                    } else {
-                        health.health_score * 0.1
-                    };
-                    
-                    if score > best_score {
-                        best_score = score;
-                        best_index = *i;
-                    }
-                }
-                best_index
-            };
-            
-            let resolver = args.resolvers[resolver_idx];
+            // Select resolver using round-robin with health awareness
+            let (resolver_idx, resolver) = resolver_pool.select_resolver();
+            let attempted_resolvers = vec![resolver_idx];
 
             // Select socket shard for this query
             let shard = socket_pool.get_shard();
@@ -360,6 +496,7 @@ impl DnsEngine {
                 &outstanding_queries,
                 &result_sender,
                 &stats,
+                &resolver_pool,
                 args.retries,
                 attempted_resolvers,
             ).await {
@@ -403,6 +540,7 @@ impl DnsEngine {
         outstanding_queries: &Arc<DashMap<u16, OutstandingQuery>>,
         result_sender: &mpsc::UnboundedSender<QueryResult>,
         stats: &Arc<EngineStats>,
+        resolver_pool: &Arc<ResolverPool>,
         max_retries: u32,
         mut attempted_resolvers: Vec<usize>,
     ) -> Result<()> {
@@ -410,7 +548,9 @@ impl DnsEngine {
         let query_data = packet.build_query()?;
         
         // Add this resolver to attempted list
-        attempted_resolvers.push(resolver_index);
+        if !attempted_resolvers.contains(&resolver_index) {
+            attempted_resolvers.push(resolver_index);
+        }
         
         // Track the outstanding query
         let outstanding = OutstandingQuery {
@@ -423,6 +563,7 @@ impl DnsEngine {
             result_sender: result_sender.clone(),
             original_id: packet.id,
             attempted_resolvers,
+            retry_delay_ms: 50, // Start with 50ms base delay
         };
         
         outstanding_queries.insert(packet.id, outstanding);
@@ -446,7 +587,7 @@ impl DnsEngine {
         let stats = self.stats.clone();
         let args = self.args.clone();
         let socket_pool = self.socket_pool.clone();
-        let resolver_health = self.resolver_health.clone();
+        let resolver_pool = self.resolver_pool.clone();
 
         tokio::spawn(async move {
             let mut buffer = vec![0u8; 4096];
@@ -462,7 +603,7 @@ impl DnsEngine {
                             &stats,
                             &args,
                             &socket_pool,
-                            &resolver_health,
+                            &resolver_pool,
                         ).await {
                             tracing::warn!("Failed to handle response on shard {}: {}", shard_id, e);
                         }
@@ -483,7 +624,7 @@ impl DnsEngine {
         stats: &Arc<EngineStats>,
         args: &Args,
         socket_pool: &Arc<SocketShardPool>,
-        resolver_health: &Arc<Mutex<HashMap<usize, ResolverHealth>>>,
+        resolver_pool: &Arc<ResolverPool>,
     ) -> Result<()> {
         let response = crate::packet::DnsPacket::parse_response(data)?;
         
@@ -500,12 +641,7 @@ impl DnsEngine {
             
             let result = if response.is_success() {
                 // Update resolver health with success
-                {
-                    let mut health_map = resolver_health.lock().unwrap();
-                    if let Some(health) = health_map.get_mut(&resolver_idx) {
-                        health.update_success(elapsed);
-                    }
-                }
+                resolver_pool.update_resolver_success(resolver_idx, elapsed);
                 
                 stats.successful_resolutions.fetch_add(1, Ordering::Relaxed);
                 QueryResult::success(
@@ -517,12 +653,8 @@ impl DnsEngine {
                 )
             } else {
                 // Update resolver health with failure
-                {
-                    let mut health_map = resolver_health.lock().unwrap();
-                    if let Some(health) = health_map.get_mut(&resolver_idx) {
-                        health.update_failure();
-                    }
-                }
+                resolver_pool.update_resolver_failure(resolver_idx);
+                
                 // Check if we should retry based on response code
                 let should_retry = match response.response_code {
                     ResponseCode::ServFail |
@@ -532,87 +664,88 @@ impl DnsEngine {
                 };
 
                 if should_retry && outstanding.retries_left > 0 {
-                    // Select best resolver based on health and attempted resolvers
-                    let next_resolver_index = {
-                        let health_map = resolver_health.lock().unwrap();
-                        let mut best_index = 0;
-                        let mut best_score = -1.0;
+                    // Select best resolver for retry excluding already attempted ones
+                    if let Some((next_resolver_index, next_resolver)) = resolver_pool.select_best_excluding(&outstanding.attempted_resolvers) {
+                        // Calculate exponential backoff delay
+                        let retry_attempt = args.retries - outstanding.retries_left;
+                        let backoff_delay = calculate_backoff_delay(retry_attempt);
                         
-                        for (i, health) in health_map.iter() {
-                            // Skip already attempted resolvers
-                            if outstanding.attempted_resolvers.contains(i) {
-                                continue;
-                            }
+                        // Spawn retry with backoff
+                        let socket_pool_clone = socket_pool.clone();
+                        let outstanding_queries_clone = outstanding_queries.clone();
+                        let stats_clone = stats.clone();
+                        let resolver_pool_clone = resolver_pool.clone();
+                        let retry_outstanding = outstanding;
+                        
+                        tokio::spawn(async move {
+                            // Wait for backoff delay
+                            tokio::time::sleep(backoff_delay).await;
                             
-                            let score = if health.is_healthy {
-                                health.health_score
-                            } else {
-                                health.health_score * 0.1
+                            // Create retry query with new ID and different resolver
+                            let retry_id = next_query_id();
+                            let mut new_attempted = retry_outstanding.attempted_resolvers.clone();
+                            new_attempted.push(next_resolver_index);
+                            
+                            let retry_outstanding_new = OutstandingQuery {
+                                domain: retry_outstanding.domain.clone(),
+                                record_type: retry_outstanding.record_type,
+                                resolver: next_resolver,
+                                resolver_index: next_resolver_index,
+                                start_time: Instant::now(), // Reset timer for retry
+                                retries_left: retry_outstanding.retries_left - 1,
+                                result_sender: retry_outstanding.result_sender.clone(),
+                                original_id: retry_outstanding.original_id,
+                                attempted_resolvers: new_attempted,
+                                retry_delay_ms: retry_outstanding.retry_delay_ms * 2, // Double delay for next retry
                             };
                             
-                            if score > best_score {
-                                best_score = score;
-                                best_index = *i;
+                            // Build and send the retry query
+                            match Self::send_retry_query(
+                                retry_outstanding_new.domain.clone(),
+                                retry_outstanding_new.record_type,
+                                next_resolver,
+                                retry_id,
+                            ).await {
+                                Ok(query_data) => {
+                                    // Track the retry query
+                                    outstanding_queries_clone.insert(retry_id, retry_outstanding_new);
+                                    stats_clone.retries.fetch_add(1, Ordering::Relaxed);
+                                    stats_clone.in_flight.fetch_add(1, Ordering::Relaxed);
+                                    
+                                    // Send the query using a socket from the pool
+                                    let shard = socket_pool_clone.get_shard();
+                                    if shard.socket.send_to(&query_data, next_resolver).await.is_err() {
+                                        // Failed to send retry, clean up
+                                        outstanding_queries_clone.remove(&retry_id);
+                                        stats_clone.in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        
+                                        // Send error result
+                                        let error_result = QueryResult::error(
+                                            retry_outstanding.domain,
+                                            retry_outstanding.record_type,
+                                            retry_outstanding.resolver,
+                                            "Failed to send retry query".to_string(),
+                                            retry_outstanding.start_time.elapsed().as_millis() as u64,
+                                        );
+                                        let _ = retry_outstanding.result_sender.send(error_result);
+                                    }
+                                }
+                                Err(_) => {
+                                    // Failed to build retry query, send error result
+                                    let error_result = QueryResult::error(
+                                        retry_outstanding.domain,
+                                        retry_outstanding.record_type,
+                                        retry_outstanding.resolver,
+                                        "Failed to build retry query".to_string(),
+                                        retry_outstanding.start_time.elapsed().as_millis() as u64,
+                                    );
+                                    let _ = retry_outstanding.result_sender.send(error_result);
+                                }
                             }
-                        }
+                        });
                         
-                        // If all resolvers have been attempted, start over with the healthiest
-                        if best_score < 0.0 {
-                            best_index = health_map.iter()
-                                .max_by(|(_, a), (_, b)| a.health_score.partial_cmp(&b.health_score).unwrap())
-                                .map(|(i, _)| *i)
-                                .unwrap_or(0);
-                        }
-                        
-                        best_index
-                    };
-                    
-                    let next_resolver = args.resolvers[next_resolver_index];
-                    
-                    // Create retry query with new ID and different resolver
-                    let retry_id = next_query_id();
-                    let mut new_attempted = outstanding.attempted_resolvers.clone();
-                    new_attempted.push(next_resolver_index);
-                    
-                    let retry_outstanding = OutstandingQuery {
-                        domain: outstanding.domain.clone(),
-                        record_type: outstanding.record_type,
-                        resolver: next_resolver,
-                        resolver_index: next_resolver_index,
-                        start_time: Instant::now(), // Reset timer for retry
-                        retries_left: outstanding.retries_left - 1,
-                        result_sender: outstanding.result_sender.clone(),
-                        original_id: outstanding.original_id,
-                        attempted_resolvers: new_attempted,
-                    };
-                    
-                    // Build and send the retry query
-                    match Self::send_retry_query(
-                        retry_outstanding.domain.clone(),
-                        retry_outstanding.record_type,
-                        next_resolver,
-                        retry_id,
-                    ).await {
-                        Ok(query_data) => {
-                            // Track the retry query
-                            outstanding_queries.insert(retry_id, retry_outstanding);
-                            stats.retries.fetch_add(1, Ordering::Relaxed);
-                            stats.in_flight.fetch_add(1, Ordering::Relaxed);
-                            
-                            // Send the query using a socket from the pool
-                            let shard = socket_pool.get_shard();
-                            if shard.socket.send_to(&query_data, next_resolver).await.is_ok() {
-                                // Retry was successful, don't send error result yet
-                                return Ok(());
-                            } else {
-                                // Failed to send retry, clean up and proceed to error result
-                                outstanding_queries.remove(&retry_id);
-                                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(_) => {
-                            // Failed to build retry query, proceed to error result
-                        }
+                        // Early return - retry is in progress
+                        return Ok(());
                     }
                 }
                 
@@ -659,7 +792,7 @@ impl DnsEngine {
         let stats = self.stats.clone();
         let args = self.args.clone();
         let socket_pool = self.socket_pool.clone();
-        let resolver_health = self.resolver_health.clone();
+        let resolver_pool = self.resolver_pool.clone();
         let timeout_duration = Duration::from_millis(self.args.timeout);
 
         tokio::spawn(async move {
@@ -685,100 +818,97 @@ impl DnsEngine {
                 for query_id in timed_out {
                     if let Some((_, outstanding)) = outstanding_queries.remove(&query_id) {
                         // Update resolver health with timeout
-                        {
-                            let mut health_map = resolver_health.lock().unwrap();
-                            if let Some(health) = health_map.get_mut(&outstanding.resolver_index) {
-                                health.update_timeout();
-                            }
-                        }
+                        resolver_pool.update_resolver_timeout(outstanding.resolver_index);
                         
                         stats.timeouts.fetch_add(1, Ordering::Relaxed);
                         stats.in_flight.fetch_sub(1, Ordering::Relaxed);
                         
                         // Try retry with different resolver if retries are available
                         if outstanding.retries_left > 0 {
-                            // Select best resolver based on health and attempted resolvers
-                            let next_resolver_index = {
-                                let health_map = resolver_health.lock().unwrap();
-                                let mut best_index = 0;
-                                let mut best_score = -1.0;
+                            // Select best resolver for retry excluding already attempted ones
+                            if let Some((next_resolver_index, next_resolver)) = resolver_pool.select_best_excluding(&outstanding.attempted_resolvers) {
+                                // Calculate exponential backoff delay
+                                let retry_attempt = args.retries - outstanding.retries_left;
+                                let backoff_delay = calculate_backoff_delay(retry_attempt);
                                 
-                                for (i, health) in health_map.iter() {
-                                    if outstanding.attempted_resolvers.contains(i) {
-                                        continue;
-                                    }
+                                // Spawn retry with backoff
+                                let socket_pool_clone = socket_pool.clone();
+                                let outstanding_queries_clone = outstanding_queries.clone();
+                                let stats_clone = stats.clone();
+                                let resolver_pool_clone = resolver_pool.clone();
+                                let retry_outstanding = outstanding;
+                                
+                                tokio::spawn(async move {
+                                    // Wait for backoff delay
+                                    tokio::time::sleep(backoff_delay).await;
                                     
-                                    let score = if health.is_healthy {
-                                        health.health_score
-                                    } else {
-                                        health.health_score * 0.1
+                                    let retry_id = next_query_id();
+                                    let mut new_attempted = retry_outstanding.attempted_resolvers.clone();
+                                    new_attempted.push(next_resolver_index);
+                                    
+                                    let retry_outstanding_new = OutstandingQuery {
+                                        domain: retry_outstanding.domain.clone(),
+                                        record_type: retry_outstanding.record_type,
+                                        resolver: next_resolver,
+                                        resolver_index: next_resolver_index,
+                                        start_time: Instant::now(),
+                                        retries_left: retry_outstanding.retries_left - 1,
+                                        result_sender: retry_outstanding.result_sender.clone(),
+                                        original_id: retry_outstanding.original_id,
+                                        attempted_resolvers: new_attempted,
+                                        retry_delay_ms: retry_outstanding.retry_delay_ms * 2,
                                     };
                                     
-                                    if score > best_score {
-                                        best_score = score;
-                                        best_index = *i;
+                                    // Try to send retry query
+                                    match Self::send_retry_query(
+                                        retry_outstanding_new.domain.clone(),
+                                        retry_outstanding_new.record_type,
+                                        next_resolver,
+                                        retry_id,
+                                    ).await {
+                                        Ok(query_data) => {
+                                            // Track the retry query
+                                            outstanding_queries_clone.insert(retry_id, retry_outstanding_new);
+                                            stats_clone.retries.fetch_add(1, Ordering::Relaxed);
+                                            stats_clone.in_flight.fetch_add(1, Ordering::Relaxed);
+                                            
+                                            // Send the query
+                                            let shard = socket_pool_clone.get_shard();
+                                            if shard.socket.send_to(&query_data, next_resolver).await.is_err() {
+                                                // Failed to send retry, clean up and send timeout error
+                                                outstanding_queries_clone.remove(&retry_id);
+                                                stats_clone.in_flight.fetch_sub(1, Ordering::Relaxed);
+                                                
+                                                let result = QueryResult::error(
+                                                    retry_outstanding.domain,
+                                                    retry_outstanding.record_type,
+                                                    retry_outstanding.resolver,
+                                                    "Timeout after retry failed".to_string(),
+                                                    retry_outstanding.start_time.elapsed().as_millis() as u64,
+                                                );
+                                                let _ = retry_outstanding.result_sender.send(result);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // Failed to build retry query, send timeout error
+                                            let result = QueryResult::error(
+                                                retry_outstanding.domain,
+                                                retry_outstanding.record_type,
+                                                retry_outstanding.resolver,
+                                                "Timeout - retry failed to build".to_string(),
+                                                retry_outstanding.start_time.elapsed().as_millis() as u64,
+                                            );
+                                            let _ = retry_outstanding.result_sender.send(result);
+                                        }
                                     }
-                                }
+                                });
                                 
-                                if best_score < 0.0 {
-                                    best_index = health_map.iter()
-                                        .max_by(|(_, a), (_, b)| a.health_score.partial_cmp(&b.health_score).unwrap())
-                                        .map(|(i, _)| *i)
-                                        .unwrap_or(0);
-                                }
-                                
-                                best_index
-                            };
-                            
-                            let next_resolver = args.resolvers[next_resolver_index];
-                            
-                            let retry_id = next_query_id();
-                            let mut new_attempted = outstanding.attempted_resolvers.clone();
-                            new_attempted.push(next_resolver_index);
-                            
-                            let retry_outstanding = OutstandingQuery {
-                                domain: outstanding.domain.clone(),
-                                record_type: outstanding.record_type,
-                                resolver: next_resolver,
-                                resolver_index: next_resolver_index,
-                                start_time: Instant::now(),
-                                retries_left: outstanding.retries_left - 1,
-                                result_sender: outstanding.result_sender.clone(),
-                                original_id: outstanding.original_id,
-                                attempted_resolvers: new_attempted,
-                            };
-                            
-                            // Try to send retry query
-                            match Self::send_retry_query(
-                                retry_outstanding.domain.clone(),
-                                retry_outstanding.record_type,
-                                next_resolver,
-                                retry_id,
-                            ).await {
-                                Ok(query_data) => {
-                                    // Track the retry query
-                                    outstanding_queries.insert(retry_id, retry_outstanding);
-                                    stats.retries.fetch_add(1, Ordering::Relaxed);
-                                    stats.in_flight.fetch_add(1, Ordering::Relaxed);
-                                    
-                                    // Send the query
-                                    let shard = socket_pool.get_shard();
-                                    if shard.socket.send_to(&query_data, next_resolver).await.is_ok() {
-                                        // Retry was successful, continue without sending error
-                                        continue;
-                                    } else {
-                                        // Failed to send retry, clean up and proceed to timeout error
-                                        outstanding_queries.remove(&retry_id);
-                                        stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-                                    }
-                                }
-                                Err(_) => {
-                                    // Failed to build retry query, proceed to timeout error
-                                }
+                                // Continue to next timeout - retry is in progress
+                                continue;
                             }
                         }
                         
-                        // No retries left or retry failed, send timeout error
+                        // No retries left or no healthy resolvers, send timeout error
                         let elapsed_ms = outstanding.start_time.elapsed().as_millis() as u64;
                         
                         let result = QueryResult::error(
@@ -799,8 +929,7 @@ impl DnsEngine {
     /// Spawn stats reporter
     fn spawn_stats_reporter(&self) -> JoinHandle<()> {
         let stats = self.stats.clone();
-        let resolver_health = self.resolver_health.clone();
-        let args = self.args.clone();
+        let resolver_pool = self.resolver_pool.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -822,29 +951,26 @@ impl DnsEngine {
                 );
                 
                 // Log resolver health summary
-                {
-                    let health_map = resolver_health.lock().unwrap();
-                    let healthy_count = health_map.values().filter(|h| h.is_healthy).count();
-                    let total_resolvers = args.resolvers.len();
-                    
-                    tracing::info!(
-                        "🏥 Resolver Health: {}/{} healthy resolvers", 
-                        healthy_count, total_resolvers
+                let healthy_count = resolver_pool.healthy_resolver_count();
+                let health_summary = resolver_pool.get_health_summary();
+                let total_resolvers = health_summary.len();
+                
+                tracing::info!(
+                    "🏥 Resolver Health: {}/{} healthy resolvers", 
+                    healthy_count, total_resolvers
+                );
+                
+                // Log top 3 healthiest resolvers
+                for (i, (resolver, health)) in health_summary.iter().take(3).enumerate() {
+                    tracing::debug!(
+                        "Top {}: {} (score: {:.2}, success: {}, timeouts: {}, avg_ms: {})",
+                        i + 1, resolver, health.health_score, health.success_count,
+                        health.timeout_count, health.avg_response_time.as_millis()
                     );
-                    
-                    // Log top 5 healthiest and worst resolvers
-                    let mut sorted_health: Vec<_> = health_map.iter().collect();
-                    sorted_health.sort_by(|a, b| b.1.health_score.partial_cmp(&a.1.health_score).unwrap());
-                    
-                    for (i, (idx, health)) in sorted_health.iter().take(3).enumerate() {
-                        let resolver = args.resolvers[**idx];
-                        tracing::debug!(
-                            "Top {}: {} (score: {:.2}, success: {}, timeouts: {}, avg_ms: {})",
-                            i + 1, resolver, health.health_score, health.success_count,
-                            health.timeout_count, health.avg_response_time.as_millis()
-                        );
-                    }
                 }
+                
+                // Log any dropped resolvers
+                resolver_pool.log_dropped_resolvers();
             }
         })
     }
@@ -864,18 +990,6 @@ impl DnsEngine {
 
     /// Get resolver health summary for final reporting
     pub fn get_resolver_health_summary(&self) -> Vec<(SocketAddr, ResolverHealth)> {
-        let health_map = self.resolver_health.lock().unwrap();
-        let mut summary = Vec::new();
-        
-        for (idx, health) in health_map.iter() {
-            if *idx < self.args.resolvers.len() {
-                let resolver = self.args.resolvers[*idx];
-                summary.push((resolver, health.clone()));
-            }
-        }
-        
-        // Sort by health score descending
-        summary.sort_by(|a, b| b.1.health_score.partial_cmp(&a.1.health_score).unwrap());
-        summary
+        self.resolver_pool.get_health_summary()
     }
 }

@@ -1,47 +1,44 @@
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
-use std::time::Duration;
 use tracing::{info, warn, error};
 
-const RESOLVERS_URL: &str = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers-trusted.txt";
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default stable resolver set for high-performance DNS resolution
+/// These are carefully curated for reliability and performance
+const DEFAULT_RESOLVERS: &[&str] = &[
+    "1.1.1.1:53",          // Cloudflare Primary
+    "1.0.0.1:53",          // Cloudflare Secondary
+    "8.8.8.8:53",          // Google Primary
+    "8.8.4.4:53",          // Google Secondary
+    "9.9.9.9:53",          // Quad9 Primary
+    "149.112.112.112:53",  // Quad9 Secondary
+    "208.67.222.222:53",   // OpenDNS Primary
+    "208.67.220.220:53",   // OpenDNS Secondary
+];
 
-/// Download and parse resolvers from the Trickest resolvers list
-pub async fn download_resolvers() -> Result<Vec<SocketAddr>> {
-    info!("📡 Downloading trusted resolvers from {}", RESOLVERS_URL);
+/// Get default stable resolvers with fallback parsing
+fn get_stable_resolvers() -> Vec<SocketAddr> {
+    let mut resolvers = Vec::new();
     
-    let client = reqwest::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
-        .user_agent("qdns/0.1.0")
-        .build()
-        .context("Failed to create HTTP client")?;
-    
-    let response = client
-        .get(RESOLVERS_URL)
-        .send()
-        .await
-        .context("Failed to download resolvers list")?;
-    
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "HTTP error downloading resolvers: {}", 
-            response.status()
-        ));
+    for resolver_str in DEFAULT_RESOLVERS {
+        match resolver_str.parse::<SocketAddr>() {
+            Ok(addr) => resolvers.push(addr),
+            Err(e) => {
+                warn!("Failed to parse default resolver {}: {}", resolver_str, e);
+            }
+        }
     }
     
-    let content = response
-        .text()
-        .await
-        .context("Failed to read response body")?;
+    if resolvers.is_empty() {
+        // Ultimate fallback - should never happen with hardcoded addresses
+        warn!("⚠️ All default resolvers failed to parse, falling back to localhost");
+        resolvers.push("127.0.0.1:53".parse().unwrap());
+    }
     
-    let resolvers = parse_resolvers(&content)?;
-    
-    info!("✅ Downloaded {} resolvers from Trickest trusted list", resolvers.len());
-    
-    Ok(resolvers)
+    info!("✅ Using {} stable default resolvers", resolvers.len());
+    resolvers
 }
 
-/// Parse resolvers from text content
+/// Parse resolvers from text content (for custom resolver files)
 fn parse_resolvers(content: &str) -> Result<Vec<SocketAddr>> {
     let mut resolvers = Vec::new();
     let mut line_count = 0;
@@ -77,7 +74,7 @@ fn parse_resolvers(content: &str) -> Result<Vec<SocketAddr>> {
     
     if resolvers.is_empty() {
         return Err(anyhow::anyhow!(
-            "No valid resolvers found in downloaded content"
+            "No valid resolvers found in content"
         ));
     }
     
@@ -89,16 +86,14 @@ fn parse_resolvers(content: &str) -> Result<Vec<SocketAddr>> {
     Ok(resolvers)
 }
 
-/// Download resolvers with fallback to default
-pub async fn get_default_resolvers() -> Vec<SocketAddr> {
-    match download_resolvers().await {
-        Ok(resolvers) => resolvers,
-        Err(e) => {
-            error!("Failed to download resolvers: {}", e);
-            warn!("⚠️  Falling back to local resolver 127.0.0.1:53");
-            vec!["127.0.0.1:53".parse().unwrap()]
-        }
-    }
+/// Get default resolvers (stable set, no external downloads)
+pub fn get_default_resolvers() -> Vec<SocketAddr> {
+    get_stable_resolvers()
+}
+
+/// Parse resolvers from a custom file (for --resolvers-file option)
+pub fn parse_resolvers_from_file(content: &str) -> Result<Vec<SocketAddr>> {
+    parse_resolvers(content)
 }
 
 #[cfg(test)]
@@ -130,5 +125,17 @@ invalid-ip
         let content = "# Only comments\n\n";
         let result = parse_resolvers(content);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_default_resolvers() {
+        let resolvers = get_default_resolvers();
+        assert!(!resolvers.is_empty());
+        assert_eq!(resolvers.len(), 8); // Should have all 8 default resolvers
+        
+        // Verify some key resolvers are present
+        assert!(resolvers.contains(&"1.1.1.1:53".parse().unwrap()));
+        assert!(resolvers.contains(&"8.8.8.8:53".parse().unwrap()));
+        assert!(resolvers.contains(&"9.9.9.9:53".parse().unwrap()));
     }
 }

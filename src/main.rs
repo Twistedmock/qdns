@@ -29,10 +29,10 @@ async fn main() -> Result<()> {
     let mut args = Args::parse();
     args.validate()?;
 
-    // Download default resolvers if none were provided
+    // Use default resolvers if none were provided
     if !args.has_custom_resolvers() {
-        info!("🔍 No custom resolvers provided, downloading default resolvers...");
-        args.resolvers = get_default_resolvers().await;
+        info!("🔍 No custom resolvers provided, using curated stable resolver set...");
+        args.resolvers = get_default_resolvers();
     }
 
     // Initialize system optimizer
@@ -160,24 +160,31 @@ async fn main() -> Result<()> {
         
         info!("🏥 Resolver Health Summary: {}/{} healthy", healthy_count, health_summary.len());
         
-        // Show top 5 and bottom 5 resolvers
+        // Show top 5 resolvers
         for (i, (resolver, health)) in health_summary.iter().take(5).enumerate() {
-            info!("  #{}: {} - Score: {:.2} (Success: {}, Timeouts: {}, Avg: {}ms)", 
-                  i + 1, resolver, health.health_score, health.success_count, 
-                  health.timeout_count, health.avg_response_time.as_millis());
+            let total_requests = health.success_count + health.failure_count + health.timeout_count;
+            let success_rate = if total_requests > 0 {
+                (health.success_count as f64 / total_requests as f64) * 100.0
+            } else {
+                0.0
+            };
+            
+            info!("  #{}: {} - Score: {:.2} Success: {:.1}% ({}/{}) Avg: {}ms", 
+                  i + 1, resolver, health.health_score, success_rate, 
+                  health.success_count, total_requests, health.avg_response_time.as_millis());
         }
         
-        if health_summary.len() > 10 {
-            info!("  ... {} more resolvers in middle ...", health_summary.len() - 10);
-        }
-        
-        // Show worst 5 resolvers
-        let worst_start = health_summary.len().saturating_sub(5);
-        if worst_start > 5 {
-            for (resolver, health) in health_summary.iter().skip(worst_start) {
-                info!("  Worst: {} - Score: {:.2} (Success: {}, Timeouts: {}, Avg: {}ms)", 
-                      resolver, health.health_score, health.success_count, 
-                      health.timeout_count, health.avg_response_time.as_millis());
+        // Show dropped resolvers
+        let dropped_resolvers: Vec<_> = health_summary.iter()
+            .filter(|(_, h)| !h.is_healthy && h.success_count + h.failure_count + h.timeout_count > 10)
+            .collect();
+            
+        if !dropped_resolvers.is_empty() {
+            info!("🚫 Dropped {} unhealthy resolvers:", dropped_resolvers.len());
+            for (resolver, health) in dropped_resolvers.iter().take(3) {
+                let total = health.success_count + health.failure_count + health.timeout_count;
+                let success_rate = (health.success_count as f64 / total as f64) * 100.0;
+                info!("    {} - {:.1}% success rate ({}/{})", resolver, success_rate, health.success_count, total);
             }
         }
     }

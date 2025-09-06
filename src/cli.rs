@@ -14,19 +14,22 @@ pub struct Args {
 
     /// DNS resolvers to use (can be specified multiple times)
     /// 
-    /// Default: Downloads resolvers from https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt
-    /// Fallback: 127.0.0.1:53 (local recursive resolver) if download fails
+    /// Default: Uses a curated set of 8 stable public DNS resolvers:
+    /// - Cloudflare: 1.1.1.1, 1.0.0.1
+    /// - Google: 8.8.8.8, 8.8.4.4  
+    /// - Quad9: 9.9.9.9, 149.112.112.112
+    /// - OpenDNS: 208.67.222.222, 208.67.220.220
     /// 
     /// For maximum performance, run a local recursive resolver like:
     /// - Unbound: https://unbound.docs.nlnetlabs.nl/
     /// - Knot Resolver: https://www.knot-resolver.cz/
     /// - systemd-resolved (if available)
     /// 
-    /// Public DNS resolvers will rate-limit and drop queries under high load!
+    /// Note: Public DNS resolvers will rate-limit and drop queries under high load!
     #[arg(
         short = 'r',
         long = "resolver",
-        help = "DNS resolver address (IP:port) - defaults to downloading from Trickest resolvers list"
+        help = "DNS resolver address (IP:port) - defaults to curated stable resolver set"
     )]
     pub resolvers: Vec<SocketAddr>,
 
